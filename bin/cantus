@@ -13,6 +13,7 @@ use Cantus::Reach ();
 use Cantus::Router ();
 use Cantus::Session ();
 use Cantus::Scenario ();
+use Cantus::Daemon ();
 
 my $VERSION = '1.0.0';
 
@@ -35,6 +36,16 @@ cantus $VERSION — a realtime voice standard built around one socket
   cantus route-test <document.json> [--to AOR] [--from AOR] [--hour HH:MM]
       Evaluate a routing document offline.  Nothing is executed.
 
+  cantus node --config node.json [--events|--quiet] [--stats SECONDS]
+      Run a node and stay up: one UDP socket, keepalives, Reach, and the
+      registration that keeps the relay pointed at this address.  The config
+      carries id, bind, relay and optional routes; CANTUS_SECRET overrides the
+      secret so the file can be committed.
+
+  cantus relay --config relay.json [--events|--quiet] [--stats SECONDS]
+      Run a relay and stay up: registrations, observed addresses, expiry, and
+      name- or handle-addressed forwarding.  It holds no call state.
+
   cantus encode hello|invite|media
       Print the wire encoding of a sample message.
 
@@ -43,6 +54,21 @@ cantus $VERSION — a realtime voice standard built around one socket
 
 USAGE
     exit 0;
+}
+
+if ($cmd eq 'node' || $cmd eq 'relay') {
+    my ($config, $events, $quiet, $stats) = (undef, undef, 0, undef);
+    GetOptions('config=s' => \$config, 'events=s' => \$events, 'quiet' => \$quiet,
+               'stats=f' => \$stats)
+        or die "cantus: bad options for $cmd (try: cantus help)\n";
+    my $daemon = Cantus::Daemon->new(
+        role   => $cmd,
+        config => Cantus::Daemon::load_config($config),
+        events => $events,
+        quiet  => $quiet,
+        stats  => $stats,
+    );
+    exit $daemon->run;
 }
 
 if ($cmd eq 'demo') {

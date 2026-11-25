@@ -24,6 +24,7 @@ sub new {
         forwarded => 0,
         dropped   => 0,
         debug     => $a{debug} // 0,
+        ttl       => $a{ttl} // 60,     # how long a registration is true
         running   => 1,
         log       => [],
     }, $class;
@@ -90,6 +91,26 @@ sub sendto {
     $self->{sock}->send($bytes, 0, scalar sockaddr_in($port, inet_aton($ip)));
 }
 
+# A registration is only true while the node keeps refreshing it (§8.2).  A
+# long-lived relay has to forget the ones that stopped, or a name that moved to
+# another host keeps sending to an address nobody is listening on.
+sub sweep {
+    my ($self) = @_;
+    my $now = time;
+    my $expired = 0;
+    for my $handle (keys %{ $self->{by_handle} }) {
+        my $entry = $self->{by_handle}{$handle};
+        next unless defined $entry->{expires} && $entry->{expires} < $now;
+        delete $self->{by_handle}{$handle};
+        if (defined $entry->{id} && ($self->{by_id}{ $entry->{id} } // '') eq $handle) {
+            delete $self->{by_id}{ $entry->{id} };
+        }
+        $expired++;
+    }
+    $self->emit({ kind => 'expired', count => $expired }) if $expired;
+    return $expired;
+}
+
 sub handle_datagram {
     my ($self, $buf, $src) = @_;
     my $kind = Cantus::Wire::kind($buf);
@@ -130,7 +151,7 @@ sub handle_datagram {
         $self->{by_handle}{$handle} = {
             addr    => $src,
             id      => $id,
-            expires => time + 60,
+            expires => time + $self->{ttl},
             limits  => $f->{10} ? $f->{10}[1] : '',
         };
         my ($ip, $port) = split /:/, $src, 2;

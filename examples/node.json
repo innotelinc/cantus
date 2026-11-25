@@ -1,0 +1,6 @@
+{
+  "id": "node@switch.example",
+  "bind": "0.0.0.0:7443",
+  "relay": "relay.example:7443",
+  "stats": 60
+}

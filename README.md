@@ -13,7 +13,7 @@ no port range to open, and no way for a call to connect with silent audio.
 
 [![Perl 5.16+](https://img.shields.io/badge/perl-5.16%2B-39457e)](spec/CANTUS-1.0.md)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-2ea043)](lib/Cantus)
-[![Assertions: 189](https://img.shields.io/badge/assertions-189%20passing-2ea043)](t)
+[![Assertions: 211](https://img.shields.io/badge/assertions-211%20passing-2ea043)](t)
 [![NAT: always on](https://img.shields.io/badge/traversal-always%20on-f5b95b)](spec/CANTUS-1.0.md)
 [![Landing page](https://img.shields.io/badge/landing-innotelinc.github.io%2Fcantus-2ea043)](https://innotelinc.github.io/cantus/)
 
@@ -47,9 +47,10 @@ A **standard** and a **working implementation of it**, in that order.
   identity, routing language, reason codes, conformance suite, and a SIP feature map.
 - [lib/Cantus](lib/Cantus) — the reference stack: ~2,500 lines of Perl 5, core
   modules only. It places real calls over real UDP sockets.
-- [bin/cantus](bin/cantus) — `demo`, `selftest`, `encode`, `route-test`.
-- [t/](t) — 189 assertions across ten files, including calls behind a real NAT
-  middlebox whose mapping table is flushed mid-call.
+- [bin/cantus](bin/cantus) — `demo`, `node`, `relay`, `selftest`, `encode`, `route-test`.
+- [t/](t) — 211 assertions across eleven files, including calls behind a real NAT
+  middlebox whose mapping table is flushed mid-call, and both service modes run
+  as real processes.
 
 Nothing here wraps an existing voice stack, and no part of the wire protocol is
 delegated to one.
@@ -60,7 +61,7 @@ Perl 5.16+ with core modules only. No CPAN, no build step, no services.
 
 ```bash
 make setup                                        # install the attribution guard hooks
-make test                                         # 189 assertions, ten files
+make test                                         # 211 assertions, eleven files
 
 perl -Ilib bin/cantus demo                        # one call, one socket, direct path
 perl -Ilib bin/cantus demo --nat symmetric        # both ends behind hard NAT, relay path
@@ -69,6 +70,27 @@ perl -Ilib bin/cantus selftest
 perl -Ilib bin/cantus encode hello                # the actual bytes, hexdumped
 perl -Ilib bin/cantus route-test examples/routes.json --to support@example.net
 ```
+
+## Run it as a service
+
+`demo` builds a scenario, places one call and exits. A deployment needs the
+opposite, so both roles also run as long-lived processes, each reading one JSON
+file and holding one port:
+
+```bash
+perl -Ilib bin/cantus relay --config examples/relay.json    # 7443/udp, registry + forwarder
+perl -Ilib bin/cantus node  --config examples/node.json     # 7443/udp, registers with the relay
+```
+
+They print one JSON event per line — `ready`, `registered`, `stats`, `stopped` —
+so a log collector reads the path decisions without a parser. A node re-registers
+every 20 s and a relay expires registrations nobody refreshed, so a name that
+moved does not keep sending to an address that stopped answering. Both exit 0 on
+SIGTERM.
+
+Secrets stay out of the files: `CANTUS_SECRET` overrides whatever the config
+says, so `examples/node.json` can be committed and the key handed to the process
+by the environment.
 
 ## The problem, measured
 
