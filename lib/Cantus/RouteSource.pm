@@ -121,7 +121,12 @@ sub _http_get {
             . "Accept: application/json\r\n"
             . "Connection: close\r\n"
             . "User-Agent: cantus-gateway\r\n";
-    $req .= "X-Api-Key: $self->{token}\r\n" if defined $self->{token} && length $self->{token};
+    # The control plane accepts either name: the gateway names itself as
+    # the caller it is, and a key-issued token still works as usual.
+    if (defined $self->{token} && length $self->{token}) {
+        $req .= "X-Routing-Token: $self->{token}\r\n";
+        $req .= "X-Api-Key: $self->{token}\r\n";
+    }
     $req .= "\r\n";
     unless (print $sock $req) {
         $self->{last_error} = "send: $!";
