@@ -197,7 +197,8 @@ sub _drain_sip {
         $self->{sip_frames}++;
         $msg->{src} = $src;
         $self->emit({ kind => 'sip', method => $msg->{method}, code => $msg->{status},
-                      src => $src, call => Cantus::Sip::header($msg, 'call-id') });
+                      src => $src, call => Cantus::Sip::header($msg, 'call-id') })
+            if $self->{cfg}{debug};
         next unless $msg->{request};
         my $m = $msg->{method};
         my $fn = $self->can('_on_' . lc $m) or do {
@@ -216,6 +217,19 @@ sub _reply {
     CORE::send($self->{sip}, $text, 0, sockaddr_in($port, inet_aton($ip)));
 }
 
+# Refusals are throttled per source: a device retrying in a loop must cost a
+# reply and nothing else, or the log becomes the attack surface.
+sub _refuse {
+    my ($self, $msg, $code, $why, %a) = @_;
+    my $now = time;
+    my $key = "$code:" . ($msg->{src} // '?');
+    if (!($self->{refuse_at}{$key} // 0) || $now - $self->{refuse_at}{$key} > 30) {
+        $self->{refuse_at}{$key} = $now;
+        $self->emit({ kind => 'refused', code => $code, why => $why, src => $msg->{src} });
+    }
+    $self->_reply($msg, $code, %a);
+}
+
 sub _on_options {
     my ($self, $msg) = @_;
     $self->_reply($msg, 200);
@@ -227,6 +241,16 @@ sub _on_options {
 sub _on_register {
     my ($self, $msg) = @_;
     my $user = $self->{account}{user} // '';
+
+    # Only the configured account is challenged. Challenging everyone turns the
+    # gateway into an oracle for whatever else on the LAN is looking for a
+    # registrar, and the challenge/response storm starves the media loop.
+    my $from = Cantus::Sip::parse_uri(Cantus::Sip::header($msg, 'from'));
+    unless ($from && defined $from->{user} && $from->{user} eq $user) {
+        $self->_refuse($msg, 403, 'unknown account');
+        return;
+    }
+
     my $pass = $self->{account}{password} // '';
     my ($ok, $why) = Cantus::Sip::verify_digest(
         msg => $msg, method => 'REGISTER', user => $user,
@@ -234,8 +258,8 @@ sub _on_register {
     );
     unless ($ok) {
         my $nonce = Cantus::Sip::nonce();
-        $self->emit({ kind => 'register-challenge', why => $why });
-        $self->_reply($msg, 401, headers => [ Cantus::Sip::challenge_header($self->{realm}, $nonce) ]);
+        $self->_refuse($msg, 401, $why,
+            headers => [ Cantus::Sip::challenge_header($self->{realm}, $nonce) ]);
         return;
     }
     my $contact = Cantus::Sip::header($msg, 'contact') // '';
