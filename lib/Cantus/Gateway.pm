@@ -18,6 +18,14 @@ package Cantus::Gateway;
 # Every call ends in a CDR line: who, to what, how long, how much audio, which
 # digits, and how it ended. Without that, "no stuck channel" is an opinion.
 #
+# Phase 2b adds the carrier leg. A `trunk` block registers the gateway's own
+# SIP account with the carrier (digest, refreshed before it expires), maps an
+# inbound DID to an address of record on the Cantus side, and carries outbound
+# calls only where the routing document says they may go -- so the document,
+# not the dialled digits, decides whether a call leaves the building. An
+# outbound carrier call is two SIP legs bridged in this process, because the
+# far end is a carrier and not a Cantus node.
+#
 # Deliberately absent: TCP/TLS, SRTP, MWI, call waiting, conferencing. A line is
 # one call; a second call to a busy line is 486, which is what a phone with one
 # line expects to hear.
@@ -34,9 +42,11 @@ use Cantus::Sip ();
 use Cantus::G711 ();
 use Cantus::Media ();
 use Cantus::Session ();
+use Cantus::Router ();
 
 use constant {
     RTP_TICK      => 0.020,
+    TRUNK_REFRESH => 280,       # carrier registrations expire at 300 s
     FRAME_SAMPLES => 160,       # 20 ms at 8 kHz
     FRAME_BYTES   => 320,       # pcm-s16
     QUEUE_MAX     => 8,         # 160 ms of buffer, then it is too late to help
@@ -70,6 +80,9 @@ sub new {
         handoff    => {},
         running    => 1,
         started    => time,
+        # A test cannot wait 25 s to prove a call that nobody answers fails
+        # out loud; production keeps the carrier-friendly default.
+        ring_timeout => $cfg->{ring_timeout} // RING_TIMEOUT,
         next_rtp   => time,
         next_reg   => 0,
         rtp_frames => 0,
@@ -81,9 +94,11 @@ sub new {
     }, $class;
 
     $self->_load_lines($cfg);
+    $self->_load_trunk($cfg);
     $self->_bind_sip($cfg);
     $self->_bind_rtp($cfg);
     $self->_make_node($_) for @{ $self->{order} };
+    $self->_make_node($self->{trunk_line}) if $self->{trunk_line};
     return $self;
 }
 
@@ -116,6 +131,73 @@ sub _load_lines {
         push @{ $self->{order} }, $line;
     }
     die "gateway: no lines configured\n" unless @{ $self->{order} };
+}
+
+# The carrier leg.  The account is a SIP account like any other, but it is not
+# one of `lines`: nobody registers to it from the LAN, and an INVITE arriving
+# on it is a phone call from the outside, not a softphone dialling in.
+sub _load_trunk {
+    my ($self, $cfg) = @_;
+    my $t = $cfg->{trunk} or return;
+
+    die "gateway: trunk needs a host\n" unless $t->{host};
+    die "gateway: trunk needs a user\n" unless $t->{user};
+    my $secret = $ENV{ $t->{secret_env} // 'TRUNK_SECRET' } // $t->{secret};
+    die 'gateway: trunk secret missing (set ' . ($t->{secret_env} // 'TRUNK_SECRET') . ")\n"
+        unless defined $secret && length $secret;
+
+    my $router;
+    if ($t->{routes}) {
+        open my $fh, '<', $t->{routes}
+            or die "gateway: cannot read routes '$t->{routes}': $!\n";
+        my $doc = do { local $/; <$fh> };
+        close $fh;
+        $router = Cantus::Router->new(doc => $doc, name => $t->{routes});
+    }
+
+    # Resolved once: the source of an inbound carrier call is checked against
+    # these addresses, so a DID cannot be dialled by anything else on the LAN.
+    my @ips;
+    my $packed = inet_aton($t->{host});
+    if ($packed) { push @ips, inet_ntoa($packed) }
+    else {
+        my $p = gethostbyname($t->{host});
+        push @ips, map { inet_ntoa($_) }
+            (gethostbyname($t->{host}))[4 .. 3 + ((gethostbyname($t->{host}))[4] // -13)]
+            if $p;
+    }
+
+    $self->{trunk} = {
+        host       => $t->{host},
+        port       => $t->{port} // 5060,
+        user       => $t->{user},
+        secret     => $secret,
+        realm      => $t->{realm} // $t->{host},
+        from       => $t->{from} // $t->{user},
+        dids       => $t->{dids} || {},
+        router     => $router,
+        addr       => $t->{addr} // ($t->{host} . ':' . ($t->{port} // 5060)),
+        ips        => \@ips,
+        registered => 0,
+        reg_call   => 'trunk-reg-' . $$ . '-' . int(rand(1_000_000)),
+        reg_cseq   => 0,
+        reg_tag    => 'tr' . int(rand(1_000_000)),
+    };
+
+    # The trunk's Cantus identity needs a domain like any other AOR, or the
+    # relay has nowhere to send the registration acknowledgement and every
+    # inbound DID waits forever for a handle.
+    my (undef, $domain) = split /\@/, $self->{base_id}, 2;
+    $domain //= 'switch.example';
+    $self->{trunk_line} = {
+        user     => 'trunk',
+        password => $secret,
+        id       => $t->{id} // ('carrier-' . $t->{user} . '@' . $domain),
+        sip_user => $t->{user},
+        target   => undef,
+        contact  => { addr => $self->{trunk}{addr} },
+        dialog   => undef,
+    };
 }
 
 sub _bind_sip {
@@ -220,6 +302,11 @@ sub stats {
         rtp_frames => $self->{rtp_frames},
         sip_frames => $self->{sip_frames},
         cantus     => { map { $_->{user} => $_->{node}->stats } @{ $self->{order} } },
+        trunk      => $self->{trunk}
+            ? { user => $self->{trunk}{user}, host => $self->{trunk}{host},
+                registered => $self->{trunk}{registered} ? 1 : 0,
+                dids => [ sort keys %{ $self->{trunk}{dids} } ] }
+            : undef,
     };
 }
 
@@ -232,7 +319,11 @@ sub run {
     $SIG{INT} = $SIG{TERM} = sub { $self->{running} = 0 };
     $self->emit({ kind => 'ready', sip => "$self->{advertise}:$self->{sip_port}",
                   rtp => $self->{rtp_port}, target => $self->{target},
-                  lines => [ map { $_->{user} } @{ $self->{order} } ] });
+                  lines => [ map { $_->{user} } @{ $self->{order} } ],
+                  ($self->{trunk}
+                    ? (trunk => { user => $self->{trunk}{user}, host => $self->{trunk}{host},
+                                  dids => [ sort keys %{ $self->{trunk}{dids} } ] })
+                    : ()) });
     $self->_register_all;
     while ($self->{running}) {
         $self->pump(TICK);
@@ -248,14 +339,15 @@ sub run {
 sub pump {
     my ($self, $timeout) = @_;
     my @socks = ($self->{sip},
-        map { $_->{dialog}{rtp} } grep { $_->{dialog} } @{ $self->{order} });
+        map { $_->{rtp} } grep { $_->{rtp} }
+        map { $_->{dialog} } (@{ $self->{order} }, ($self->{trunk_line} ? ($self->{trunk_line}) : ())));
     my $sel = IO::Select->new(@socks);
     for my $fh ($sel->can_read($timeout // 0)) {
         if ($fh == $self->{sip}) { $self->_drain_sip }
         else                     { $self->_drain_rtp($fh) }
     }
 
-    for my $line (@{ $self->{order} }) {
+    for my $line (@{ $self->{order} }, ($self->{trunk_line} ? ($self->{trunk_line}) : ())) {
         eval { $line->{node}->pump(0) };
         $self->emit({ kind => 'error', line => $line->{user}, error => $@ }) if $@;
     }
@@ -264,6 +356,12 @@ sub pump {
         $self->_register_all;
         $self->{next_reg} = time + REFRESH;
     }
+    if ($self->{trunk} && time >= ($self->{next_trunk} // 0)) {
+        $self->_trunk_register;
+        # Unregistered means the carrier has not heard us yet: retry sooner
+        # than the refresh interval, or an inbound call arrives at nobody.
+        $self->{next_trunk} = time + ($self->{trunk}{registered} ? TRUNK_REFRESH : 30);
+    }
     $self->_rtp_tick;
     $self->_timers;
     return 1;
@@ -271,7 +369,93 @@ sub pump {
 
 sub _register_all {
     my ($self) = @_;
-    $_->{node}->register for @{ $self->{order} };
+    # The carrier leg's node is a node like the others: without its handle the
+    # gateway can receive a DID and then have nowhere to place it.
+    $_->{node}->register for (@{ $self->{order} }, ($self->{trunk_line} ? ($self->{trunk_line}) : ()));
+}
+
+# REGISTER to the carrier, and answer its challenge once.  A carrier that never
+# hears a registration will not deliver the DID, and nothing on the LAN would
+# notice: the gateway would look healthy with no way in.
+sub _trunk_register {
+    my ($self, $auth) = @_;
+    my $t = $self->{trunk} or return;
+    $t->{reg_cseq}++;
+    my $uri = 'sip:' . $t->{host};
+    my @headers = ('Expires: 300');
+    push @headers, $auth if $auth;
+    my $text = Cantus::Sip::request(
+        method  => 'REGISTER',
+        uri     => $uri,
+        via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
+        from    => '<sip:' . $t->{user} . '@' . $t->{host} . '>;tag=' . $t->{reg_tag},
+        to      => '<sip:' . $t->{user} . '@' . $t->{host} . '>',
+        call_id => $t->{reg_call},
+        cseq    => $t->{reg_cseq},
+        contact => '<sip:' . $t->{user} . '@' . $self->{advertise} . ':' . $self->{sip_port} . '>',
+        headers => \@headers,
+    );
+    $self->_send_to($t->{addr}, $text);
+    $self->{trunk_pending} = time;
+}
+
+# WWW-Authenticate: Digest realm="x", nonce="y", qop="auth" -> a hash.
+sub _digest_challenge {
+    my ($self, $header) = @_;
+    return {} unless defined $header;
+    $header =~ s/^\s*Digest\s+//i;
+    my %p;
+    while ($header =~ /(\w+)\s*=\s*"([^"]*)"/g) { $p{ lc $1 } = $2 }
+    while ($header =~ /(\w+)\s*=\s*([^,"\s]+)/g)  { $p{ lc $1 } //= $2 }
+    return \%p;
+}
+
+sub _trunk_response {
+    my ($self, $msg) = @_;
+    my $t = $self->{trunk};
+    my $code = $msg->{status} // 0;
+
+    if ($code == 401 || $code == 407) {
+        my $challenge = Cantus::Sip::header($msg,
+            $code == 401 ? 'www-authenticate' : 'proxy-authenticate');
+        my $p = $self->_digest_challenge($challenge);
+        unless ($p->{nonce}) {
+            $self->emit({ kind => 'trunk-challenge-missing', code => $code,
+                          challenge => defined $challenge ? $challenge : 'none' });
+            return;
+        }
+        # A carrier may offer qop="auth,auth-int"; we only speak auth, so
+        # anything else is signed without qop rather than with the wrong one.
+        my $qop = $p->{qop};
+        $qop = (defined $qop && $qop =~ /\bauth\b/) ? 'auth' : undef;
+        my $realm = $p->{realm} // $t->{realm};
+        my $uri   = 'sip:' . $t->{host};
+        my %d = (
+            user => $t->{user}, password => $t->{secret}, realm => $realm,
+            method => 'REGISTER', uri => $uri, nonce => $p->{nonce},
+            qop => $qop, nc => '00000001', cnonce => 'cantus' . int(rand(1_000_000)),
+        );
+        $d{response} = Cantus::Sip::digest_response(%d);
+        my $header = Cantus::Sip::digest_authorization(
+            user => $t->{user}, realm => $realm, nonce => $p->{nonce},
+            uri => $uri, response => $d{response},
+            qop => $qop, nc => $d{nc}, cnonce => $d{cnonce},
+        );
+        $self->emit({ kind => 'trunk-challenged', code => $code });
+        $self->_trunk_register($header);
+        return;
+    }
+
+    if ($code >= 200 && $code < 300) {
+        $self->{trunk}{registered} = 1;
+        $self->{trunk}{at} = time;
+        $self->emit({ kind => 'trunk-registered', user => $t->{user},
+                      host => $t->{host}, expires => 300 });
+        return;
+    }
+
+    $self->{trunk}{registered} = 0;
+    $self->emit({ kind => 'trunk-refused', code => $code, user => $t->{user} });
 }
 
 sub _timers {
@@ -286,11 +470,25 @@ sub _timers {
         if (my $s = $self->_session_of($d)) {
             $d->{line}{node}->reject($s, Cantus::Session::reason_id('TIMEOUT'));
         }
-        $self->_fail_peer($d, 408);
+        # The target's phone gets a final response, not a BYE, and the CDR is
+        # written once, by _end_dialog below, as "no answer".
+        $self->_reply($d->{invite}, 408, to_tag => $d->{to_tag}) if $d->{invite};
+        # A transfer whose target never picked up has not happened: the
+        # transferor is told so (RFC 3515) and its call is left exactly as it
+        # was, which is why this runs before the ring leg is torn down.
+        if (my $td = $d->{transfer_of}) {
+            $self->emit({ kind => 'transfer-failed', call => $td->{call_id},
+                          to => $d->{line}{user}, code => 408 });
+            $self->_notify_refer($d->{refer}, $td, 408) if $d->{refer};
+        }
+        if ($d->{trunk_out} && (my $pd = $self->{dialogs_by_call}{ $d->{peer_call} // '' })) {
+            $self->_reply($pd->{invite}, 408, to_tag => $pd->{to_tag}) if $pd->{invite};
+            $self->_end_dialog($pd, 'carrier no answer', notify => 0);
+        }
         $self->_end_dialog($d, 'no answer', notify => 0);
     }
     for my $user (keys %{ $self->{handoff} }) {
-        next if $now - ($self->{handoff}{$user}{at} // 0) < RING_TIMEOUT;
+        next if $now - ($self->{handoff}{$user}{at} // 0) < $self->{ring_timeout};
         delete $self->{handoff}{$user};
         $self->emit({ kind => 'transfer-timeout', line => $user });
     }
@@ -357,7 +555,8 @@ sub _refuse {
 
 sub _contact {
     my ($self, $line) = @_;
-    return '<sip:' . $line->{user} . '@' . $self->{advertise} . ':' . $self->{sip_port} . '>';
+    my $user = $line->{sip_user} // $line->{user};
+    return '<sip:' . $user . '@' . $self->{advertise} . ':' . $self->{sip_port} . '>';
 }
 
 sub _line_for {
@@ -422,8 +621,31 @@ sub _on_invite {
     my ($self, $msg) = @_;
     my $call_id = Cantus::Sip::header($msg, 'call-id') // return;
 
+    # A phone that has not been answered yet retransmits its INVITE, and a
+    # retransmission is not a second call: answering it as one builds a second
+    # carrier leg, a second RTP port, and a call whose audio goes to a dialog
+    # nobody is holding.
+    # Only an *initial* INVITE can be a retransmission: a re-INVITE on a live
+    # dialog carries a To tag and is hold, resume or a media change.
+    if (!Cantus::Sip::tag($msg, 'to') && (my $dup = $self->{dialogs_by_call}{$call_id})) {
+        my $code = $dup->{state} eq 'active' ? 200
+                 : $dup->{state} eq 'ended'  ? 486 : 180;
+        $self->_reply($msg, $code, to_tag => $dup->{to_tag},
+            ($code == 200
+                ? (sdp => $dup->{sdp}, contact => $self->_contact($dup->{line}))
+                : ()));
+        return;
+    }
+
     my $line = $self->_line_for($msg);
     unless ($line) {
+        # An INVITE that is not from a registered line may be the carrier
+        # delivering a DID.  It is only believed when it comes from the
+        # carrier's own address, so a DID cannot be dialled from the LAN.
+        if ($self->{trunk} && $self->_trunk_source($msg)) {
+            $self->_trunk_invite($msg);
+            return;
+        }
         $self->emit({ kind => 'invite-refused', call => $call_id, src => $msg->{src} });
         $self->_refuse($msg, 403, 'unregistered caller');
         return;
@@ -453,6 +675,14 @@ sub _on_invite {
     my $to = Cantus::Sip::parse_uri($msg->{uri});
     my $to_user = $to && defined $to->{user} ? $to->{user} : '';
     my $peer_line = $self->{lines}{$to_user};
+
+    # A number that is not a line is a call leaving the building, and leaving
+    # is the routing document's decision, not the dialled digits'.
+    if (!$peer_line && $self->{trunk} && defined $to_user && $to_user =~ /^\d{3,}$/) {
+        $self->_trunk_outbound($msg, $line, $to_user, $sdp);
+        return;
+    }
+
     # Dialling another line's number is an internal call: the Cantus leg goes
     # to that line's own address of record, so both ends are ordinary nodes.
     my $aor = $peer_line ? $peer_line->{id} : $line->{target};
@@ -575,7 +805,8 @@ sub _on_refer {
     }
 
     my $ring = $self->_ring_line($target, undef,
-        from => $line->{user}, dial_aor => $d->{target_aor}, transfer_of => $d);
+        from => $line->{user}, dial_aor => $d->{target_aor}, transfer_of => $d,
+        refer => $msg);
     unless ($ring) {
         $self->_notify_refer($msg, $d, 480);
         return;
@@ -605,6 +836,121 @@ sub _notify_refer {
         body    => $body, content_type => 'message/sipfrag',
     );
     $self->_send_to($refer->{src}, $text);
+}
+
+# The carrier's own address, resolved at startup.  A DID is public knowledge;
+# the source address is what says the call came from the carrier and not from
+# a laptop on the LAN dialling the number it can read off a bill.
+sub _trunk_source {
+    my ($self, $msg) = @_;
+    my ($ip) = split /:/, $msg->{src} // '', 2;
+    return 0 unless $ip;
+    return scalar grep { $_ eq $ip } @{ $self->{trunk}{ips} || [] };
+}
+
+# A DID arrives: look up its address of record, place the Cantus leg, and only
+# then answer the carrier.  `dids` is the whole inbound routing document -- a
+# DID that is not in it is 404, not "whatever is configured".
+sub _trunk_invite {
+    my ($self, $msg) = @_;
+    my $t = $self->{trunk};
+    my $call_id = Cantus::Sip::header($msg, 'call-id') // return;
+
+    my $to  = Cantus::Sip::parse_uri($msg->{uri});
+    my $did = $to && defined $to->{user} ? $to->{user} : '';
+    $did =~ s/^\+//;
+    my $aor = $t->{dids}{$did} // $t->{dids}{ '+' . $did };
+    unless ($aor) {
+        $self->emit({ kind => 'trunk-unknown-did', call => $call_id, did => $did, src => $msg->{src} });
+        $self->_reply($msg, 404);
+        return;
+    }
+
+    my $line = $self->{trunk_line};
+    if ($line->{dialog}) {
+        $self->emit({ kind => 'busy', line => 'trunk', did => $did });
+        $self->_reply($msg, 486);
+        return;
+    }
+    my $sdp = Cantus::Sip::sdp_parse($msg->{body});
+    unless ($sdp && $sdp->{ip}) { $self->_reply($msg, 488); return }
+
+    my $d = $self->_new_dialog($line,
+        call_id   => $call_id,
+        from_tag  => Cantus::Sip::tag($msg, 'from') // 'carrier',
+        codec     => $sdp->{codec}, event_pt => $sdp->{event_pt},
+        phone_placed => 0, trunk_in => 1,
+        from_user => $did, to_user => $aor, target_aor => $aor,
+        addr      => $msg->{src},   # replies and BYE go where the call came from
+    ) or do { $self->_reply($msg, 503); return };
+    $d->{invite} = $msg;
+    $d->{remote} = "$sdp->{ip}:$sdp->{port}";
+    $self->_reply($msg, 180, to_tag => $d->{to_tag});
+    $self->emit({ kind => 'trunk-invite', call => $call_id, did => $did,
+                  to => $aor, codec => $d->{codec} });
+    $self->_place($line, $d);
+}
+
+# An extension dialled a number.  The routing document decides whether it may
+# leave and where to; then two SIP legs exist in this process -- the phone's
+# and the carrier's -- and each one sends what the other received.
+sub _trunk_outbound {
+    my ($self, $msg, $line, $number, $sdp) = @_;
+    my $t = $self->{trunk};
+
+    my $dec = $t->{router}
+        ? $t->{router}->decide({ to => $number, from => $line->{user}, verified => 1 })
+        : { matched => 0, route => undef, actions => [ { reject => 3 } ] };
+
+    my ($forward) = grep { ref $_ eq 'HASH' && $_->{forward} } @{ $dec->{actions} || [] };
+    my $dest = ref $forward->{forward} eq 'HASH' ? $forward->{forward}{to} : undef;
+    if (defined $dest && $dest =~ /^pstn:\s*$/) { $dest = $number }
+    elsif (defined $dest)                        { $dest =~ s/^pstn:// }
+
+    unless (defined $dest && length $dest) {
+        $self->emit({ kind => 'route-rejected', line => $line->{user},
+                      to => $number, route => $dec->{route} });
+        # A refused outbound call still has to be accounted for: it is a call
+        # the operator will be asked about, and no carrier leg exists to log it.
+        $self->_cdr({
+            call => Cantus::Sip::header($msg, 'call-id') // 'no-call-id',
+            line => $line, from_user => $line->{user}, to_user => $number,
+            phone_placed => 1, started => time, ended_at => time,
+            rx_frames => 0, tx_frames => 0, dtmf => [],
+        }, $dec->{matched} ? 'rejected by route' : 'no route');
+        $self->_reply($msg, 403, to_tag => 'gwr' . int(rand(1_000_000)));
+        return 1;
+    }
+
+    my $d = $self->_new_dialog($line,
+        call_id  => Cantus::Sip::header($msg, 'call-id'),
+        from_tag => Cantus::Sip::tag($msg, 'from') // 'gw',
+        cseq     => (Cantus::Sip::header($msg, 'cseq') // '1') =~ /^(\d+)/ ? $1 : 1,
+        codec    => $sdp->{codec}, event_pt => $sdp->{event_pt},
+        phone_placed => 1, from_user => $line->{user}, to_user => $number,
+        route    => $dec->{route},
+    ) or do { $self->_reply($msg, 503); return 1 };
+    $d->{invite} = $msg;
+    $d->{remote} = "$sdp->{ip}:$sdp->{port}";
+    $self->_reply($msg, 180, to_tag => $d->{to_tag});
+
+    my $td = $self->_new_dialog($self->{trunk_line},
+        outbound => 1, trunk_out => 1,
+        from_user => $t->{from}, to_user => $dest,
+        uri_host => $t->{host}, sip_realm => $t->{host}, addr => $t->{addr},
+        peer_call => $d->{call_id}, route => $dec->{route},
+    );
+    unless ($td) {
+        $self->_reply($msg, 503, to_tag => $d->{to_tag});
+        $self->_end_dialog($d, 'no carrier leg', notify => 0);
+        return 1;
+    }
+    $td->{ring_deadline} = time + $self->{ring_timeout};
+    $self->{pending}{ $td->{call_id} } = $td;
+    $self->_send_invite($td);
+    $self->emit({ kind => 'trunk-call', call => $td->{call_id}, phone_call => $d->{call_id},
+                  line => $line->{user}, to => $dest, route => $dec->{route} });
+    return 1;
 }
 
 # ------------------------------------------------------------------ SIP out
@@ -653,11 +999,20 @@ sub _new_dialog {
         direction    => 'sendrecv',
         session      => undef,
     };
-    $d->{sdp} = Cantus::Sip::sdp_answer(
-        ip => $self->{advertise}, port => $d->{rtp_port},
-        codec => $codec, event_pt => $d->{event_pt},
-    );
-    $line->{dialog} = $d;
+            $d->{sdp} = Cantus::Sip::sdp_answer(
+            ip => $self->{advertise}, port => $d->{rtp_port},
+            codec => $codec, event_pt => $d->{event_pt},
+        );
+        # A carrier leg names its own host, From user and destination address:
+        # a carrier expects its own URI in the request line, not the gateway's.
+        $d->{uri_host}  = $a{uri_host} if $a{uri_host};
+        $d->{sip_realm} = $a{sip_realm} if $a{sip_realm};
+        $d->{addr}      = $a{addr} if $a{addr};
+        $d->{peer_call} = $a{peer_call};
+        $d->{route}     = $a{route};
+        $d->{trunk_in}  = $a{trunk_in}  ? 1 : 0;
+        $d->{trunk_out} = $a{trunk_out} ? 1 : 0;
+        $line->{dialog} = $d;
     $self->{dialogs_by_call}{ $d->{call_id} } = $d;
     return $d;
 }
@@ -691,7 +1046,10 @@ sub _ring_line {
         transfer_of => $ctx{transfer_of},
     ) or return undef;
     $d->{session} = $s->{call} if $s;
-    $d->{ring_deadline} = time + RING_TIMEOUT;
+    # Kept so a transfer that never connects can be reported to the transferor
+    # through the subscription it opened, with the code that failed.
+    $d->{refer} = $ctx{refer} if $ctx{refer};
+    $d->{ring_deadline} = time + $self->{ring_timeout};
     $self->{pending}{ $d->{call_id} } = $d;
     $self->_send_invite($d);
     $self->emit({ kind => 'ringing', call => $d->{call_id}, line => $line->{user},
@@ -699,81 +1057,147 @@ sub _ring_line {
     return $d;
 }
 
+# The Authorization header a carrier's challenge is asking for.  REGISTER
+# signs the registration URI, an INVITE signs the request URI it was sent to,
+# so the caller says which.
+sub _trunk_auth_header {
+    my ($self, $method, $uri, $msg, $code) = @_;
+    my $t = $self->{trunk} or return undef;
+    my $challenge = Cantus::Sip::header($msg,
+        $code == 407 ? 'proxy-authenticate' : 'www-authenticate');
+    my $p = $self->_digest_challenge($challenge);
+    return undef unless $p->{nonce};
+    my $qop = $p->{qop};
+    $qop = (defined $qop && $qop =~ /\bauth\b/) ? 'auth' : undef;
+    my $realm = $p->{realm} // $t->{realm};
+    my %d = (
+        user => $t->{user}, password => $t->{secret}, realm => $realm,
+        method => $method, uri => $uri, nonce => $p->{nonce},
+        qop => $qop, nc => '00000001', cnonce => 'cantus' . int(rand(1_000_000)),
+    );
+    $d{response} = Cantus::Sip::digest_response(%d);
+    return Cantus::Sip::digest_authorization(
+        user => $t->{user}, realm => $realm, nonce => $p->{nonce},
+        uri => $uri, response => $d{response},
+        qop => $qop, nc => $d{nc}, cnonce => $d{cnonce},
+    );
+}
+
 sub _send_invite {
-    my ($self, $d) = @_;
-    my $uri = 'sip:' . $d->{to_user} . '@' . $self->{advertise};
+    my ($self, $d, $auth) = @_;
+    my $host  = $d->{uri_host} // $self->{advertise};
+    my $realm = $d->{sip_realm} // $self->{realm};
+    my $uri = 'sip:' . $d->{to_user} . '@' . $host;
+    my @headers;
+    push @headers, $auth if $auth;
     my $text = Cantus::Sip::request(
         method  => 'INVITE',
         uri     => $uri,
         via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
-        from    => '<sip:' . $d->{from_user} . '@' . $self->{realm} . '>;tag=' . $d->{from_tag},
-        to      => '<sip:' . $d->{to_user} . '@' . $self->{realm} . '>',
+        from    => '<sip:' . $d->{from_user} . '@' . $realm . '>;tag=' . $d->{from_tag},
+        to      => '<sip:' . $d->{to_user} . '@' . $realm . '>',
         call_id => $d->{call_id},
         cseq    => ++$d->{cseq},
         contact => $self->_contact($d->{line}),
         body    => $d->{sdp},
+        headers => \@headers,
     );
-    $self->_send_to($d->{line}{contact}{addr}, $text);
+    $self->_send_to($d->{addr} // $d->{line}{contact}{addr}, $text);
 }
 
 sub _send_ack {
     my ($self, $d, $addr) = @_;
     my $text = Cantus::Sip::request(
         method  => 'ACK',
-        uri     => 'sip:' . $d->{to_user} . '@' . $self->{advertise},
+        uri     => 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise}),
         via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
-        from    => '<sip:' . $d->{from_user} . '@' . $self->{realm} . '>;tag=' . $d->{from_tag},
-        to      => '<sip:' . $d->{to_user} . '@' . $self->{realm} . '>;tag=' . $d->{to_tag},
+        from    => '<sip:' . $d->{from_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{from_tag},
+        to      => '<sip:' . $d->{to_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{to_tag},
         call_id => $d->{call_id},
         cseq    => $d->{cseq},
         contact => $self->_contact($d->{line}),
     );
-    $self->_send_to($addr // $d->{line}{contact}{addr}, $text);
+    $self->_send_to($addr // $d->{addr} // $d->{line}{contact}{addr}, $text);
 }
 
 sub _send_cancel {
     my ($self, $d) = @_;
     my $text = Cantus::Sip::request(
         method  => 'CANCEL',
-        uri     => 'sip:' . $d->{to_user} . '@' . $self->{advertise},
+        uri     => 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise}),
         via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
-        from    => '<sip:' . $d->{from_user} . '@' . $self->{realm} . '>;tag=' . $d->{from_tag},
-        to      => '<sip:' . $d->{to_user} . '@' . $self->{realm} . '>',
+        from    => '<sip:' . $d->{from_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{from_tag},
+        to      => '<sip:' . $d->{to_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>',
         call_id => $d->{call_id},
         cseq    => $d->{cseq},
         contact => $self->_contact($d->{line}),
     );
-    $self->_send_to($d->{line}{contact}{addr}, $text);
+    $self->_send_to($d->{addr} // $d->{line}{contact}{addr}, $text);
 }
 
 sub _send_bye {
     my ($self, $d, $reason) = @_;
     my $text = Cantus::Sip::request(
         method  => 'BYE',
-        uri     => 'sip:' . $d->{to_user} . '@' . $self->{advertise},
+        uri     => 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise}),
         via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
-        from    => '<sip:' . $d->{from_user} . '@' . $self->{realm} . '>;tag=' . $d->{from_tag},
-        to      => '<sip:' . $d->{to_user} . '@' . $self->{realm} . '>;tag=' . $d->{to_tag},
+        from    => '<sip:' . $d->{from_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{from_tag},
+        to      => '<sip:' . $d->{to_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{to_tag},
         call_id => $d->{call_id},
         cseq    => ++$d->{cseq},
         contact => $self->_contact($d->{line}),
     );
-    $self->_send_to($d->{line}{contact}{addr}, $text);
+    $self->_send_to($d->{addr} // $d->{line}{contact}{addr}, $text);
     $self->emit({ kind => 'bye-sent', call => $d->{call_id}, reason => $reason });
 }
 
 sub _on_response {
     my ($self, $msg) = @_;
     my $call_id = Cantus::Sip::header($msg, 'call-id') // return;
+
+    # A carrier REGISTER reply is not a dialog: it never answers a call and it
+    # must be handled before the pending-dialog lookup, which would drop it.
+    if ($self->{trunk} && ($call_id eq $self->{trunk}{reg_call})) {
+        my ($cn, $cm) = (Cantus::Sip::header($msg, 'cseq') // '') =~ /(\d+)\s+(\S+)/;
+        if (($cm // '') eq 'REGISTER') { $self->_trunk_response($msg); return }
+    }
+
     my $d = $self->{pending}{$call_id} or return;
     my $code = $msg->{status} // 0;
     return if $code < 200;
+
+    # A carrier challenges an INVITE the way it challenges a REGISTER: the call
+    # has not been refused, it has asked us to prove who we are.  The leg stays
+    # pending and is sent again with the credentials, once.
+    if ($d->{trunk_out} && ($code == 401 || $code == 407) && !$d->{auth_sent}) {
+        my $uri = 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{trunk}{host});
+        my $auth = $self->_trunk_auth_header('INVITE', $uri, $msg, $code);
+        unless ($auth) {
+            $self->emit({ kind => 'trunk-challenge-missing', code => $code, call => $call_id });
+            return;
+        }
+        $d->{auth_sent} = 1;
+        $self->emit({ kind => 'trunk-invite-challenged', code => $code, call => $call_id });
+        $self->_send_invite($d, $auth);
+        return;
+    }
+
     delete $self->{pending}{$call_id};
     my $line = $d->{line};
 
     if ($code >= 300) {
         $self->emit({ kind => 'line-unavailable', call => $call_id,
                       line => $line->{user}, code => $code });
+        # A carrier that refuses the outbound leg ends the call the phone was
+        # told was ringing: leaving it ringing until it gives up is a call the
+        # caller cannot tell from one that is still being set up.
+        if ($d->{trunk_out} && (my $pd = $self->{dialogs_by_call}{ $d->{peer_call} // '' })) {
+            $self->_reply($pd->{invite}, $code == 486 ? 486 : ($code == 404 ? 404 : 480),
+                          to_tag => $pd->{to_tag})
+                if $pd->{state} eq 'ringing' && $pd->{invite};
+            delete $d->{peer};
+            $self->_end_dialog($pd, "carrier $code", notify => 0);
+        }
         if (my $s = $self->_session_of($d)) {
             $line->{node}->reject($s, Cantus::Session::reason_id('UNAVAILABLE'));
         }
@@ -795,6 +1219,24 @@ sub _on_response {
     $self->emit({ kind => 'answered', call => $call_id, line => $line->{user},
                   codec => $d->{codec}, remote => $d->{remote},
                   rtp_port => $d->{rtp_port} });
+
+    # An outbound carrier leg: the phone has been rung but the call is not up
+    # until the carrier answers, so its 200 is answered now, with our SDP.
+    if ($d->{trunk_out}) {
+        my $pd = $d->{peer_call} ? $self->{dialogs_by_call}{ $d->{peer_call} } : undef;
+        if ($pd && $pd->{state} eq 'ringing' && $pd->{invite}) {
+            $pd->{peer} = $d;
+            $d->{peer} = $pd;
+            $pd->{state} = 'active';
+            $pd->{answered_at} = time;
+            $self->_reply($pd->{invite}, 200, to_tag => $pd->{to_tag},
+                          contact => $self->_contact($pd->{line}), sdp => $pd->{sdp});
+            $self->emit({ kind => 'answered', call => $pd->{call_id}, line => $pd->{line}{user},
+                          to => $d->{to_user}, route => $d->{route}, codec => $d->{codec},
+                          remote => $d->{remote}, rtp_port => $pd->{rtp_port} });
+        }
+        return;
+    }
 
     # The phone is up; only now does the Cantus side get to answer.
     if (my $s = $self->_session_of($d)) {
@@ -857,6 +1299,13 @@ sub _end_dialog {
         eval { $line->{node}->hangup($d->{session}, 'NORMAL') };
     }
     $self->_send_bye($d, $why) if $a{notify};
+    # A bridge has two legs; ending one without the other leaves a carrier call
+    # billed and a phone that thinks it is still talking.
+    if (my $peer = delete $d->{peer}) {
+        delete $peer->{peer};
+        $self->_end_dialog($peer, $why, notify => ($peer->{answered_at} ? 1 : 0))
+            if $peer->{state} ne 'ended';
+    }
     $self->_release_dialog($d);
     $self->_cdr($d, $why);
 }
@@ -871,7 +1320,7 @@ sub _cdr {
         line      => $d->{line}{user},
         from      => $d->{from_user},
         to        => $d->{to_user},
-        direction => $d->{phone_placed} ? 'outbound' : 'inbound',
+        direction => ($d->{phone_placed} || $d->{trunk_out}) ? 'outbound' : 'inbound',
         result    => $result,
         answered  => $d->{answered_at} ? 1 : 0,
         seconds   => sprintf('%.1f', ($d->{ended_at} // time) - $d->{started}),
@@ -1028,8 +1477,8 @@ sub _dtmf_to_phone {
 
 sub _drain_rtp {
     my ($self, $fh) = @_;
-    my ($d) = grep { $_ && $_->{rtp} && $_->{rtp} == $fh }
-              map { $_->{dialog} } @{ $self->{order} };
+    my ($d) = grep { $_->{rtp} && $_->{rtp} == $fh }
+              values %{ $self->{dialogs_by_call} };
     return unless $d;
 
     while (1) {
@@ -1052,6 +1501,11 @@ sub _drain_rtp {
                           line => $d->{line}{user}, digit => $digit, source => 'phone' });
             if (my $s = $self->_session_of($d)) {
                 $d->{line}{node}->send_dtmf($s, $digit);
+            }
+            elsif ($d->{peer}) {
+                # A carrier leg has no Cantus session to carry the digit, so
+                # the press goes out as RFC 4733 on the other SIP leg.
+                $self->_dtmf_to_phone($d->{peer}, $digit);
             }
             next;
         }
@@ -1083,8 +1537,7 @@ sub _rtp_tick {
     $self->{next_rtp} += RTP_TICK;
     $self->{next_rtp} = $now + RTP_TICK if $self->{next_rtp} < $now - 1;
 
-    for my $line (@{ $self->{order} }) {
-        my $d = $line->{dialog} or next;
+    for my $d (values %{ $self->{dialogs_by_call} }) {
         next unless $d->{state} eq 'active' && $d->{rtp} && $d->{remote};
         my ($ip, $port) = split /:/, $d->{remote}, 2;
         next unless $ip && $port;
@@ -1110,7 +1563,11 @@ sub _rtp_tick {
             next;
         }
 
-        my $pcm = shift @{ $d->{out} };
+        # A bridged leg sends what the other leg received; a Cantus leg sends
+        # what the far end handed it.
+        my $pn  = $d->{peer};
+        my $pcm = $pn ? shift @{ $pn->{in} } : shift @{ $d->{out} };
+        $d->{bridged_frames}++ if $pcm && $pn;
         my $payload = $pcm
             ? ($d->{codec} eq 'PCMA' ? Cantus::G711::pcm_to_a($pcm) : Cantus::G711::pcm_to_mu($pcm))
             : ($d->{codec} eq 'PCMA' ? Cantus::G711::a_silence() : Cantus::G711::mu_silence());

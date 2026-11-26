@@ -284,7 +284,10 @@ sub wait_answered {
     my ($self, $timeout) = @_;
     my $deadline = time + ($timeout // INVITE_TIMEOUT);
     while (time < $deadline) {
-        my $resp = $self->_recv(0.2) or next;
+        # A phone that pumps media while it waits -- which a test does, and a
+        # real one does too -- must not throw away the final response it is
+        # waiting for.  pump_tick parks it here instead of dropping it.
+        my $resp = shift @{ $self->{responses} || [] } || $self->_recv(0.2) or next;
         next unless $resp->{status};
         next unless (Cantus::Sip::header($resp, 'call-id') // '') eq $self->{call_id};
         if ($resp->{status} == 401 || $resp->{status} == 407) {
@@ -436,7 +439,7 @@ sub pump_tick {
                 }
                 next;
             }
-            next unless $pkt->{pt} == ($self->{codec} eq 'PCMA' ? 8 : 0);
+            next unless $pkt->{pt} == (($self->{codec} // 'PCMU') eq 'PCMA' ? 8 : 0);
 
             my $pcm = $pkt->{pt} == 8
                 ? Cantus::G711::a_to_pcm($pkt->{payload})
@@ -450,9 +453,26 @@ sub pump_tick {
             push @{ $self->{received} }, $pcm if @{ $self->{received} } < 400;
         }
 
+        my $msg = $self->_recv(0);
+        if ($msg && !$msg->{request}) {
+            push @{ $self->{responses} }, $msg;
+            $msg = undef;
+        }
+        # A NOTIFY on a REFER subscription is how a transfer reports itself,
+        # and its sipfrag body is the only place the outcome exists.  A phone
+        # that ignores it cannot tell a completed transfer from a failed one.
+        if ($msg && ($msg->{method} // '') eq 'NOTIFY') {
+            push @{ $self->{notifies} }, {
+                call  => Cantus::Sip::header($msg, 'call-id'),
+                event => Cantus::Sip::header($msg, 'event'),
+                state => Cantus::Sip::header($msg, 'subscription-state'),
+                body  => $msg->{body},
+            };
+            $self->_send(Cantus::Sip::response($msg, 200));
+            $msg = undef;
+        }
         # A BYE from the far end ends the window early: a call that was hung up
         # must not read as a call that carried audio.
-        my $msg = $self->_recv(0);
         if ($msg && ($msg->{method} // '') eq 'BYE') {
             $self->_send(Cantus::Sip::response($msg, 200));
             $self->{ended} = 1;
@@ -475,6 +495,7 @@ sub _report {
         heard_tone => ($tone >= 0.5 && ($w->{rx_peak} // 0) > 0) ? 1 : 0,
         dtmf       => $w->{dtmf} || [],
         ended      => $self->{ended} ? 1 : 0,
+        sipfrags   => [ map { $_->{body} } @{ $self->{notifies} || [] } ],
     };
 }
 

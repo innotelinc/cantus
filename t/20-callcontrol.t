@@ -69,6 +69,8 @@ my $gateway = Cantus::Gateway->new(
         bind => "127.0.0.1:$sip_port", advertise => '127.0.0.1', realm => 'cantus',
         id => 'gateway@test', relay => $relay_addr, target => 'node@test',
         secret => $SECRET, rtp_port => free_port(),
+        # The failed-transfer case must be provable in seconds, not in 25.
+        ring_timeout => 2,
         accounts => [
             { user => '101', id => 'gw-101@test' },
             { user => '102', id => 'gw-102@test' },
@@ -132,16 +134,34 @@ sub talk {
 # how long that takes depends on the host.  Polling says "audio arrives", not
 # "audio arrived inside one arbitrary window".
 sub wait_audio {
-    my ($phone, $seconds) = @_;
+    my ($phone, $seconds, @others) = @_;
     my $deadline = time + $seconds;
     my ($frames, $peak) = (0, 0);
     while (time < $deadline) {
-        my $w = talk(0.8, $phone)->{ $phone->{user} };
+        my $w = talk(0.8, $phone, @others)->{ $phone->{user} };
         $frames += $w->{rx_frames};
         $peak = $w->{rx_peak} if $w->{rx_peak} > $peak;
         last if $peak > 0;
     }
     return { rx_frames => $frames, rx_peak => $peak };
+}
+
+# Wait for the NOTIFY a REFER subscription answers with.  The phone pumps its
+# own media here, so the window is the same one a real handset sits in.
+# A REFER is answered with a 200 sipfrag at once and with the final outcome
+# later, so a caller waiting for the *outcome* has to say which one it wants.
+sub wait_sipfrag {
+    my ($phone, $seconds, $match) = @_;
+    my $deadline = time + $seconds;
+    while (time < $deadline) {
+        $phone->pump_tick;
+        for my $n (@{ $phone->{notifies} || [] }) {
+            next if $match && ($n->{body} // '') !~ $match;
+            return $n;
+        }
+        sleep 0.01;
+    }
+    return undef;
 }
 
 sub cdr_events {
@@ -247,6 +267,63 @@ my $we2 = wait_audio($e, 8);
 ok($we2->{rx_peak} > 0,
    "and it carries audio ($we2->{rx_frames} frames, peak $we2->{rx_peak})");
 $e->bye;
+talk(0.6, $e);
+
+# 102 was left in the transferred call; the next scenario needs the line free.
+$d->bye;
+talk(0.6, $d);
+
+# ------------------------------- transfer whose target is rung and never answers
+
+my $f = phone('101');
+my $g = phone('102');    # registered, and deliberately never answered
+ok($f->register, '101 registers for the transfer that will fail');
+ok($g->register, '102 registers but will not pick up');
+
+($ok, $why) = $f->invite('node@test');
+($ok, $why) = $f->wait_answered(8) if $ok;
+ok($ok, "101 is on a call to the endpoint ($why)");
+ok(wait_audio($f, 6)->{rx_peak} > 0, 'and the call is carrying audio');
+
+my $moved_before = scalar grep { ($_->{result} // '') eq 'transferred' } cdr_events();
+
+my ($ref2, $why2) = $f->refer('102');
+ok($ref2, "101 transfers the call to 102 ($why2)");
+ok($g->wait_invite(5), '102 is rung for the transferred call');
+
+# 102 never answers.  The transferor has to be told, through the REFER
+# subscription it opened, that the transfer did not happen.
+my $notify = wait_sipfrag($f, 12, qr/^SIP\/2\.0 408/);
+ok($notify, 'the transferor gets a NOTIFY for the transfer it asked for');
+like($notify->{body} // '', qr/^SIP\/2\.0 408/, 'and its sipfrag says the transfer timed out');
+like($notify->{state} // '', qr/terminated/, 'and the subscription is closed, not left open');
+
+# The original call is the part that matters: a failed transfer must not take
+# the call with it.
+ok(!$f->{ended}, 'the original call is still up after the failed transfer');
+ok(wait_audio($f, 6)->{rx_peak} > 0, 'and it still carries audio to the endpoint');
+
+my @cdr3 = cdr_events();
+my ($noanswer) = grep { ($_->{line} // '') eq '102' && ($_->{result} // '') eq 'no answer' } @cdr3;
+ok($noanswer, 'the leg that was rung and never answered has its own CDR');
+is($noanswer->{answered}, 0, 'recorded as unanswered');
+my $moved_after = scalar grep { ($_->{result} // '') eq 'transferred' } @cdr3;
+is($moved_after, $moved_before, 'and no CDR claims the call was transferred');
+
+ok($f->bye, '101 hangs up the call it kept');
+talk(0.6, $f);
+
+# No stuck channel: the line that was rung is free for the next call.
+my $h = phone('101');
+ok($h->register, '101 registers once more');
+($ok, $why) = $h->invite('102');
+ok($ok, "101 can dial 102 again ($why)");
+ok($g->wait_invite(6), '102 is rung by an ordinary call');
+ok($g->answer, '102 answers it');
+($ok, $why) = $h->wait_answered(8);
+ok($ok, "and the call connects ($why)");
+ok(wait_audio($h, 6, $g)->{rx_peak} > 0, 'with audio');
+$h->bye;
 
 reap();
 pass('all components stopped');

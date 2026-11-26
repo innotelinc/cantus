@@ -9,5 +9,15 @@
   ],
   "relay": "127.0.0.1:7443",
   "target": "node@switch.example",
+  "trunk": {
+    "host": "newyork1.voip.ms",
+    "port": 5060,
+    "user": "235662_telnolab",
+    "secret_env": "TRUNK_SECRET",
+    "realm": "newyork1.voip.ms",
+    "from": "14132642700",
+    "dids": { "14132642700": "node@switch.example" },
+    "routes": "deploy/routes.json"
+  },
   "debug": 0
 }

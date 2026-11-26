@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "default": { "reject": 3 },
+  "routes": [
+    {
+      "name": "carrier-echo-test",
+      "when": { "to": "4443" },
+      "then": [ { "forward": { "to": "pstn:4443" } } ]
+    },
+    {
+      "name": "carrier-dtmf-test",
+      "when": { "to": "4747" },
+      "then": [ { "forward": { "to": "pstn:4747" } } ]
+    },
+    {
+      "name": "pstn-north-america",
+      "when": { "to": "1*" },
+      "then": [ { "forward": { "to": "pstn:" } } ]
+    }
+  ]
+}
