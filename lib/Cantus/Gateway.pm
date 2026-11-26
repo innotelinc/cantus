@@ -947,12 +947,16 @@ sub _trunk_invite {
     my $to  = Cantus::Sip::parse_uri($msg->{uri});
     my $did = $to && defined $to->{user} ? $to->{user} : '';
     $did =~ s/^\+//;
+    # The national number, the eleven-digit form and E.164 are the same number:
+    # normalise before deciding, so the document carries one rule per DID rather
+    # than a route per form the carrier might choose.
+    my $lookup = $did =~ /^[2-9]\d{9}$/ ? "1$did" : $did;
     # The routing document is the only answer to "where does this DID go". A
     # carrier picks a digit form and the operator's document names both; a rule
     # that refuses — a fax number, a DID with no line — is a decision too, so the
     # carrier is told what the rule says instead of being told 404.
     my $dec = $t->{router}
-        ? $t->{router}->decide({ to => $did, verified => 1 })
+        ? $t->{router}->decide({ to => $lookup, verified => 1 })
         : { matched => 0, route => undef, actions => [ { reject => 3 } ] };
 
     my ($fwd) = grep { ref $_ eq 'HASH' && $_->{forward} } @{ $dec->{actions} || [] };
@@ -1179,51 +1183,27 @@ sub _ring_line {
 # The Authorization header a carrier's challenge is asking for.  REGISTER
 # signs the registration URI, an INVITE signs the request URI it was sent to,
 # so the caller says which.
-sub _trunk_auth_header {
-    my ($self, $method, $uri, $msg, $code) = @_;
-    my $t = $self->{trunk} or return undef;
+# A challenge becomes an Authorization header for whichever account was
+# challenged. Carrier and peer are separate accounts, and naming one keeps
+# either password out of a header meant for the other.
+sub _auth_header {
+    my ($self, $acct, $method, $uri, $msg, $code) = @_;
+    return undef unless $acct && defined $acct->{secret} && length $acct->{secret};
     my $challenge = Cantus::Sip::header($msg,
         $code == 407 ? 'proxy-authenticate' : 'www-authenticate');
     my $p = $self->_digest_challenge($challenge);
     return undef unless $p->{nonce};
     my $qop = $p->{qop};
     $qop = (defined $qop && $qop =~ /\bauth\b/) ? 'auth' : undef;
-    my $realm = $p->{realm} // $t->{realm};
+    my $realm = $p->{realm} // $acct->{realm};
     my %d = (
-        user => $t->{user}, password => $t->{secret}, realm => $realm,
+        user => $acct->{user}, password => $acct->{secret}, realm => $realm,
         method => $method, uri => $uri, nonce => $p->{nonce},
         qop => $qop, nc => '00000001', cnonce => 'cantus' . int(rand(1_000_000)),
     );
     $d{response} = Cantus::Sip::digest_response(%d);
     return Cantus::Sip::digest_authorization(
-        user => $t->{user}, realm => $realm, nonce => $p->{nonce},
-        uri => $uri, response => $d{response},
-        qop => $qop, nc => $d{nc}, cnonce => $d{cnonce},
-    );
-}
-
-# The peer's challenge, answered with the peer's own credentials. It is the
-# same digest the carrier path uses, kept separate because the two accounts are
-# different and neither password belongs in a header meant for the other.
-sub _peer_auth_header {
-    my ($self, $method, $uri, $msg, $code) = @_;
-    my $p = $self->{peer} or return undef;
-    return undef unless defined $p->{secret} && length $p->{secret};
-    my $challenge = Cantus::Sip::header($msg,
-        $code == 407 ? 'proxy-authenticate' : 'www-authenticate');
-    my $c = $self->_digest_challenge($challenge);
-    return undef unless $c->{nonce};
-    my $qop = $c->{qop};
-    $qop = (defined $qop && $qop =~ /\bauth\b/) ? 'auth' : undef;
-    my $realm = $c->{realm} // $p->{realm};
-    my %d = (
-        user => $p->{user}, password => $p->{secret}, realm => $realm,
-        method => $method, uri => $uri, nonce => $c->{nonce},
-        qop => $qop, nc => '00000001', cnonce => 'cantus' . int(rand(1_000_000)),
-    );
-    $d{response} = Cantus::Sip::digest_response(%d);
-    return Cantus::Sip::digest_authorization(
-        user => $p->{user}, realm => $realm, nonce => $c->{nonce},
+        user => $acct->{user}, realm => $realm, nonce => $p->{nonce},
         uri => $uri, response => $d{response},
         qop => $qop, nc => $d{nc}, cnonce => $d{cnonce},
     );
@@ -1316,7 +1296,7 @@ sub _on_response {
     # not a credential, so the same proof the carrier asks for is given here.
     if (($code == 401 || $code == 407) && $d->{peer_leg} && !$d->{auth_sent}) {
         my $uri = 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise});
-        my $auth = $self->_peer_auth_header('INVITE', $uri, $msg, $code);
+        my $auth = $self->_auth_header($self->{peer}, 'INVITE', $uri, $msg, $code);
         unless ($auth) {
             $self->emit({ kind => 'peer-challenge-missing', code => $code, call => $call_id });
             delete $self->{pending}{$call_id};
@@ -1338,7 +1318,7 @@ sub _on_response {
     # pending and is sent again with the credentials, once.
     if ($d->{trunk_out} && ($code == 401 || $code == 407) && !$d->{auth_sent}) {
         my $uri = 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{trunk}{host});
-        my $auth = $self->_trunk_auth_header('INVITE', $uri, $msg, $code);
+        my $auth = $self->_auth_header($self->{trunk}, 'INVITE', $uri, $msg, $code);
         unless ($auth) {
             $self->emit({ kind => 'trunk-challenge-missing', code => $code, call => $call_id });
             return;
@@ -1400,15 +1380,21 @@ sub _on_response {
     # send audio across.
     if ($d->{peer_in}) {
         my $cd = $d->{peer};
-        if ($cd && $cd->{state} eq 'ringing' && $cd->{invite}) {
-            $cd->{state} = 'active';
-            $cd->{answered_at} = time;
-            $self->_reply($cd->{invite}, 200, to_tag => $cd->{to_tag},
-                          contact => $self->_contact($cd->{line}), sdp => $cd->{sdp});
-            $self->emit({ kind => 'answered', call => $cd->{call_id}, line => $cd->{line}{user},
-                          to => $d->{to_user}, route => $cd->{route}, codec => $d->{codec},
-                          remote => $d->{remote}, rtp_port => $cd->{rtp_port} });
+        unless ($cd && $cd->{state} eq 'ringing' && $cd->{invite}) {
+            # The carrier left while the peer was still ringing. The 200 above
+            # was ACKed, so this leg has to be hung up rather than left talking
+            # to a call that no longer exists.
+            $self->emit({ kind => 'peer-abandoned', call => $d->{call_id} });
+            $self->_end_dialog($d, 'carrier gone', notify => 1);
+            return;
         }
+        $cd->{state} = 'active';
+        $cd->{answered_at} = time;
+        $self->_reply($cd->{invite}, 200, to_tag => $cd->{to_tag},
+                      contact => $self->_contact($cd->{line}), sdp => $cd->{sdp});
+        $self->emit({ kind => 'answered', call => $cd->{call_id}, line => $cd->{line}{user},
+                      to => $d->{to_user}, route => $cd->{route}, codec => $d->{codec},
+                      remote => $d->{remote}, rtp_port => $cd->{rtp_port} });
         return;
     }
 
@@ -1531,6 +1517,13 @@ sub _end_dialog {
     # billed and a phone that thinks it is still talking.
     if (my $peer = delete $d->{peer}) {
         delete $peer->{peer};
+        # A leg that is still ringing is cancelled, not BYE'd: there is no dialog
+        # at the other end yet, and an INVITE nobody cancels keeps ringing until
+        # that switch gives up on its own.
+        if ($peer->{state} eq 'ringing' && !$peer->{answered_at}
+            && delete $self->{pending}{ $peer->{call_id} }) {
+            $self->_send_cancel($peer);
+        }
         $self->_end_dialog($peer, $why, notify => ($peer->{answered_at} ? 1 : 0))
             if $peer->{state} ne 'ended';
     }

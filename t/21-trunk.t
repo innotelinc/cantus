@@ -488,11 +488,9 @@ print $rfh JSON::PP->new->canonical->encode({
     routes  => [
         { name => 'carrier-echo', when => { to => '4443' },
           then => [ { forward => { to => 'pstn:4443' } } ] },
-        # Both digit forms of the same DID, because a carrier picks one of them
-        # and the document, not the gateway, says where each one goes.
+        # One rule per DID. The edge normalises E.164 and the national number
+        # before it decides, so the carrier's choice of form needs no route.
         { name => 'did-14132642700', when => { to => '14132642700' },
-          then => [ { answer => {} }, { forward => { to => 'ext:101' } } ] },
-        { name => 'did-4132642700', when => { to => '4132642700' },
           then => [ { answer => {} }, { forward => { to => 'ext:101' } } ] },
         # Numbers we own but do not answer: the document refuses them.
         { name => 'did-14135550111-fax', when => { to => '14135550111' },
@@ -672,8 +670,25 @@ my $ten = do {
     $ev;
 };
 ok($ten, 'and the ten-digit form of the same DID lands on it');
-is($ten->{route}, 'did-4132642700', 'through its own route');
+is($ten->{route}, 'did-14132642700', 'through the one rule the document carries');
 is($ten->{to}, 'gw-101@trunk.test', 'to line 101');
+
+# E.164 is the third spelling of the same number and takes the same rule.
+my $e164 = do {
+    my %seen = map { ($_->{call} // '') => 1 } events_of('trunk-invite');
+    $carrier->invite_in(did => '+14132642700', gw => "127.0.0.1:$sip_port");
+    my $ev;
+    my $deadline = time + 3;
+    while (time < $deadline && !$ev) {
+        spin(0.2);
+        ($ev) = grep { !$seen{$_->{call} // ''} } events_of('trunk-invite');
+    }
+    $carrier->bye_in("127.0.0.1:$sip_port");
+    spin(0.6);
+    $ev;
+};
+ok($e164, 'and the E.164 form is still the same call');
+is($e164->{route}, 'did-14132642700', 'matched without a route per form');
 
 # A fax number: the document says reject, so the carrier is refused — not 404.
 $carrier->invite_in(did => '14135550111', gw => "127.0.0.1:$sip_port");
@@ -693,10 +708,12 @@ is($unrouted->{route}, 'did-14135550112-unrouted', 'quoting the unrouted route')
 
 # A number the document does not know falls to its default, which is a refusal:
 # the gateway never invents a destination.
-$carrier->invite_in(did => '9999999999', gw => "127.0.0.1:$sip_port");
+# Six digits, so it is not a North American number and no outbound rule's
+# `1*` pattern can match it either: the default is what is being tested.
+$carrier->invite_in(did => '999999', gw => "127.0.0.1:$sip_port");
 spin(1.2);
 is($carrier->{in}{code}, 403, 'an unknown number takes the document default');
-my $unknown = did_event('trunk-rejected-did', '9999999999', 1);
+my $unknown = did_event('trunk-rejected-did', '999999', 1);
 ok($unknown, 'and is logged as rejected, not as a routing failure');
 ok(!defined $unknown->{route}, 'with no route name, because none matched');
 
@@ -757,6 +774,16 @@ $carrier->invite_in(did => '14135550123', gw => "127.0.0.1:$sip_port");
 spin(4.5);
 is($carrier->{in}{code}, 408, 'a peer that never answers gives the carrier 408');
 ok($peer->{cancels} >= 1, 'and its leg was cancelled rather than left ringing');
+
+# The carrier gives up while the peer is still ringing: the INVITE to the peer
+# has to be cancelled, or the extension rings on for a call nobody is on.
+my $cancels_before = $peer->{cancels};
+$carrier->invite_in(did => '14135550123', gw => "127.0.0.1:$sip_port");
+spin(0.8);
+$carrier->bye_in("127.0.0.1:$sip_port");
+spin(1.0);
+cmp_ok($peer->{cancels}, '>', $cancels_before,
+    'and a carrier hangup cancels a peer leg that had not answered');
 
 # ---------------------------------------------------------------- outbound
 
