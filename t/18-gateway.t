@@ -151,4 +151,64 @@ my $csrc = "\x82\x00" . pack('nNN', 1, 0, 9) . 'csrcdata' . 'payload';
 my $c = Cantus::Sip::rtp_parse($csrc);
 is($c->{payload}, 'payload', 'a CSRC-bearing packet is parsed from the right offset');
 
+# ---------------------------------------------------------------- DTMF
+
+my $event = Cantus::Sip::rtp_event_build(
+    event => Cantus::Sip::dtmf_event_id('5'), duration => 320);
+is(length $event, 4, 'an RFC 4733 event is four octets');
+my $pe = Cantus::Sip::rtp_event_parse($event);
+is($pe->{event}, 5, 'the event id is read back');
+is($pe->{duration}, 320, 'and the duration');
+ok(!$pe->{end}, 'a press in progress is not the end');
+ok(Cantus::Sip::rtp_event_parse(Cantus::Sip::rtp_event_build(event => 5, end => 1))->{end},
+   'and the end bit survives');
+is(Cantus::Sip::dtmf_digit(5), '5', 'event 5 is the digit 5');
+is(Cantus::Sip::dtmf_digit(10), '*', 'event 10 is star');
+is(Cantus::Sip::dtmf_digit(11), '#', 'event 11 is hash (RFC 4733: 12-15 are A-D)');
+is(Cantus::Sip::dtmf_digit(12), 'A', 'and 12 is A');
+is(Cantus::Sip::dtmf_event_id('#'), 11, 'and the mapping goes both ways');
+is(Cantus::Sip::dtmf_digit(99), undef, 'an event outside the table is not a digit');
+
+# ---------------------------------------------------------------- hold and REFER
+
+is($sdp->{event_pt}, 101, 'the telephone-event payload type is taken from the offer');
+like(Cantus::Sip::sdp_answer(ip => '1.2.3.4', port => 4000, codec => 'PCMU', event_pt => 101),
+     qr/a=rtpmap:101 telephone-event\/8000/,
+     'and answered, or the phone keeps its digits to itself');
+like(Cantus::Sip::sdp_answer(ip => '1.2.3.4', port => 4000, codec => 'PCMU', direction => 'recvonly'),
+     qr/^a=recvonly/m, 'a hold is answered with the mirrored direction');
+is(Cantus::Sip::sdp_parse("c=IN IP4 1.2.3.4\r\nm=audio 5000 RTP/AVP 0\r\na=sendonly\r\n")->{direction},
+   'sendonly', 'hold is read from the offer');
+is(Cantus::Sip::sdp_parse("c=IN IP4 1.2.3.4\r\nm=audio 5000 RTP/AVP 0\r\n")->{direction},
+   'sendrecv', 'and a call with no direction is a normal one');
+
+my $refer = Cantus::Sip::parse(join("\r\n",
+    'REFER sip:node@192.168.1.53:5062 SIP/2.0',
+    'Via: SIP/2.0/UDP 192.168.1.20:5060;branch=z9hG4bK9',
+    'From: <sip:101@192.168.1.20>;tag=abc',
+    'To: <sip:node@192.168.1.53>;tag=gw',
+    'Call-ID: call-9',
+    'CSeq: 3 REFER',
+    'Refer-To: <sip:102@192.168.1.53>',
+    'Content-Length: 0', '',
+));
+is(Cantus::Sip::refer_to($refer)->{user}, '102', 'the REFER target is read');
+is(Cantus::Sip::refer_to($msg), undef, 'and an INVITE has no REFER target');
+
+# An INVITE the gateway originates has to carry its body or the far end has no
+# address to send audio to; a BYE has to not carry one.
+my $out_invite = Cantus::Sip::request(
+    method => 'INVITE', uri => 'sip:102@1.2.3.4', via => '1.2.3.4:5062;branch=z9hG4bK1',
+    from => '<sip:101@cantus>;tag=a', to => '<sip:102@cantus>',
+    call_id => 'c', cseq => 1, contact => '<sip:101@1.2.3.4:5062>',
+    body => "v=0\r\n",
+);
+like($out_invite, qr/Content-Type: application\/sdp/, 'an originated INVITE names its SDP');
+like($out_invite, qr/Content-Length: 5\r\n\r\nv=0/, 'and its body follows the length');
+unlike(Cantus::Sip::request(
+    method => 'BYE', uri => 'sip:102@1.2.3.4', via => '1.2.3.4:5062;branch=z9hG4bK2',
+    from => '<sip:101@cantus>;tag=a', to => '<sip:102@cantus>;tag=b',
+    call_id => 'c', cseq => 2, contact => '<sip:101@1.2.3.4:5062>'),
+    qr/Content-Type/, 'a BYE carries no body');
+
 done_testing();

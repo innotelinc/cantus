@@ -1181,6 +1181,13 @@ sub _on_info {
     }
 }
 
+# The session behind a call id, for an edge that has to act on a call it was
+# told about by an event (answer it when a phone picks up, not before).
+sub session {
+    my ($self, $call) = @_;
+    return $self->{sessions}{$call};
+}
+
 sub send_dtmf {
     my ($self, $s, $digit) = @_;
     $self->send_call_msg($s, 12, {

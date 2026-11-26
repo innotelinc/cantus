@@ -115,8 +115,10 @@ sub response {
     return join("\r\n", @out) . "\r\n\r\n";
 }
 
-# A request the gateway originates (BYE).  The dialog's own identifiers are
-# carried so the far end can match it to the call it thinks it has.
+# A request the gateway originates: BYE, INVITE, REFER's NOTIFY.  The dialog's
+# own identifiers are carried so the far end can match it to the call it thinks
+# it has, and a body is included only when there is one -- an INVITE with a
+# `Content-Length: 0` and a body is a message every stack rejects.
 sub request {
     my (%a) = @_;
     my @out = ("$a{method} $a{uri} SIP/2.0");
@@ -127,6 +129,13 @@ sub request {
     push @out, 'CSeq: ' . $a{cseq} . ' ' . $a{method};
     push @out, "Contact: $a{contact}" if $a{contact};
     push @out, 'Max-Forwards: 70';
+    push @out, @{ $a{headers} || [] };
+    my $body = $a{body} // '';
+    if (length $body) {
+        push @out, 'Content-Type: ' . ($a{content_type} // 'application/sdp');
+        push @out, 'Content-Length: ' . length $body;
+        return join("\r\n", @out) . "\r\n\r\n" . $body;
+    }
     push @out, 'Content-Length: 0';
     return join("\r\n", @out) . "\r\n\r\n";
 }
@@ -216,6 +225,12 @@ sub sdp_parse {
         if ($line =~ /^a=rtpmap:(\d+) (\S+)\/(\d+)/) {
             $s{rtpmap}{$1} = { name => uc $2, clock => $3 };
         }
+        # RFC 4733: the payload type the phone will send key presses on.  It is
+        # negotiated, not assumed: a phone that offered 101 and is answered
+        # without it keeps its digits to itself.
+        if ($line =~ /^a=rtpmap:(\d+) telephone-event\/8000/i) {
+            $s{event_pt} = $1;
+        }
         if ($line =~ /^a=(sendrecv|sendonly|recvonly|inactive)/) {
             $s{direction} = $1;
         }
@@ -232,9 +247,13 @@ sub sdp_parse {
     return {
         codec => $codec, port => $m->{port}, ip => $s{connection},
         ptime => $s{ptime}, direction => $s{direction} // 'sendrecv',
+        event_pt => $s{event_pt},
     };
 }
 
+# An answer (or an offer, which is the same shape here).  `direction` is how a
+# hold is expressed: the party that holds sends `sendonly` and is answered
+# `recvonly`, so neither side mistakes a held line for a dead one.
 sub sdp_answer {
     my (%a) = @_;
     my $codec = $a{codec} // 'PCMU';
@@ -242,17 +261,64 @@ sub sdp_answer {
     my $name  = $codec;
     my $ip    = $a{ip};
     my $port  = $a{port};
+    my $dir   = $a{direction} // 'sendrecv';
+    my @payloads = $pt;
+    my @rtpmap = "a=rtpmap:$pt $name/8000";
+    if (defined $a{event_pt}) {
+        push @payloads, $a{event_pt};
+        push @rtpmap, "a=rtpmap:$a{event_pt} telephone-event/8000";
+    }
     return join("\r\n",
         'v=0',
         "o=cantus-gateway 0 0 IN IP4 $ip",
         's=cantus gateway',
         "c=IN IP4 $ip",
         't=0 0',
-        "m=audio $port RTP/AVP $pt",
-        "a=rtpmap:$pt $name/8000",
+        'm=audio ' . $port . ' RTP/AVP ' . join(' ', @payloads),
+        @rtpmap,
         'a=ptime:20',
-        'a=sendrecv',
+        "a=$dir",
     ) . "\r\n";
+}
+
+# The target of a REFER: who the call is being handed to.
+sub refer_to {
+    my ($msg) = @_;
+    my $h = header($msg, 'refer-to') // return undef;
+    return parse_uri($h);
+}
+
+# ---------------------------------------------------------------- DTMF
+
+my @EVENT_DIGITS = ('0' .. '9', '*', '#', 'A', 'B', 'C', 'D');
+
+sub dtmf_event_id {
+    my ($digit) = @_;
+    return undef unless defined $digit;
+    for my $i (0 .. $#EVENT_DIGITS) { return $i if $EVENT_DIGITS[$i] eq $digit }
+    return undef;
+}
+
+sub dtmf_digit {
+    my ($id) = @_;
+    return undef unless defined $id && $id >= 0 && $id <= $#EVENT_DIGITS;
+    return $EVENT_DIGITS[$id];
+}
+
+# RFC 4733 payload: event id, end bit and volume, duration in samples.
+sub rtp_event_parse {
+    my ($payload) = @_;
+    return undef unless defined $payload && length $payload >= 4;
+    my ($event, $flags, $duration) = unpack('CCn', substr($payload, 0, 4));
+    return { event => $event, end => ($flags & 0x80) ? 1 : 0,
+             volume => $flags & 0x3F, duration => $duration };
+}
+
+sub rtp_event_build {
+    my (%a) = @_;
+    return pack('CCn', $a{event} & 0xFF,
+        ($a{end} ? 0x80 : 0) | (($a{volume} // 10) & 0x3F),
+        $a{duration} // 160);
 }
 
 # ---------------------------------------------------------------- RTP

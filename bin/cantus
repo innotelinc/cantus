@@ -39,15 +39,20 @@ cantus $VERSION — a realtime voice standard built around one socket
       relay and the return to a direct path.
 
   cantus gateway --config gateway.json [--quiet]
-      The SIP edge: one account, one extension, G.711 at the border and
-      pcm-s16 inside. A registered softphone calls it; the call is placed
-      through a Cantus node, so reach, relay fallback and rebinding are the
-      same code a production node runs.
+      The SIP edge: one account per line, G.711 at the border and pcm-s16
+      inside, with the call control a phone expects -- DTMF, hold and REFER
+      transfer -- and a CDR line for every call. A registered softphone calls
+      it; the call is placed through a Cantus node, so reach, relay fallback
+      and rebinding are the same code a production node runs.
 
-  cantus phone --server HOST:PORT --password PW [--seconds 6] [--json]
-      A SIP test phone: register with digest auth, invite, send a tone at
-      the asked-for amplitude, and report what came back -- frames, peak and
-      whether the far end's 440 Hz tone was actually heard.
+  cantus phone --server HOST:PORT --password PW [--user 101] [--target 102]
+               [--answer] [--actions "dtmf:5,hold:1,resume:1,refer:102"]
+               [--seconds 6] [--json]
+      A SIP test phone: register with digest auth, then either invite
+      --target or, with --answer, wait for a call and pick it up. It sends a
+      tone at the asked-for amplitude and reports what came back -- frames,
+      peak, whether the far end's 440 Hz tone arrived, and the digits it
+      heard.
 
   cantus health [--config node.json] [--nat symmetric] [--json]
       What a container runs as its health check: place a real call behind a
@@ -190,10 +195,11 @@ if ($cmd eq 'gateway') {
 }
 
 if ($cmd eq 'phone') {
-    my ($server, $user, $password, $target, $seconds, $json) =
-        ('127.0.0.1:5062', '101', undef, undef, 6, 0);
+    my ($server, $user, $password, $target, $seconds, $json, $answer, $actions) =
+        ('127.0.0.1:5062', '101', undef, undef, 6, 0, 0, undef);
     GetOptions('server=s' => \$server, 'user=s' => \$user, 'password=s' => \$password,
-               'target=s' => \$target, 'seconds=f' => \$seconds, 'json' => \$json)
+               'target=s' => \$target, 'seconds=f' => \$seconds, 'json' => \$json,
+               'answer' => \$answer, 'actions=s' => \$actions)
         or die "cantus: bad options for phone (try: cantus help)\n";
     $password //= $ENV{GATEWAY_PASSWORD};
     die "cantus: phone needs --password or GATEWAY_PASSWORD\n" unless defined $password;
@@ -203,7 +209,44 @@ if ($cmd eq 'phone') {
         target => $target // $user, seconds => $seconds, quiet => $json,
     );
     my ($ok, $why) = $phone->register;
-    my $report = $ok ? $phone->call : { ok => 0, error => $why };
+    if ($ok) {
+        if ($answer) {
+            my $invite = $phone->wait_invite($seconds);
+            ($ok, $why) = $invite ? $phone->answer($invite) : (0, 'no call arrived');
+        }
+        else {
+            ($ok, $why) = $phone->invite;
+            ($ok, $why) = $phone->wait_answered if $ok;
+        }
+    }
+
+    my $report = { ok => 0, error => $why };
+    if ($ok) {
+        my %tot = (rx_frames => 0, tx_frames => 0, rx_peak => 0, dtmf => '');
+        my $add = sub {
+            my ($w) = @_;
+            $tot{rx_frames} += $w->{rx_frames};
+            $tot{tx_frames} = $w->{tx_frames};
+            $tot{rx_peak} = $w->{rx_peak} if $w->{rx_peak} > $tot{rx_peak};
+            $tot{tone_440}  = $w->{tone_440};
+            $tot{heard_tone} = 1 if $w->{heard_tone};
+            $tot{dtmf} .= join('', @{ $w->{dtmf} || [] });
+            $tot{ended} = 1 if $w->{ended};
+        };
+        for my $a (split /,/, ($actions // '')) {
+            next unless length $a;
+            if    ($a =~ /^dtmf:(.+)$/)            { $phone->send_dtmf($1); $add->($phone->pump(0.3)) }
+            elsif ($a =~ /^hold(?::([\d.]+))?$/)   { $phone->hold;   $add->($phone->pump($1 // 1)) }
+            elsif ($a =~ /^resume(?::([\d.]+))?$/) { $phone->resume; $add->($phone->pump($1 // 1)) }
+            elsif ($a =~ /^refer:(.+)$/)           { $phone->refer($1); $add->($phone->pump(1.5)) }
+            elsif ($a =~ /^wait:([\d.]+)$/)        { $add->($phone->pump($1)) }
+            else { die "cantus: unknown action '$a' (dtmf:D, hold[:S], resume[:S], refer:EXT, wait:S)\n" }
+        }
+        $add->($phone->pump($seconds));
+        $phone->bye unless $tot{ended};
+        $report = { ok => 1, answered => $phone->{answered} ? 1 : 0, %tot };
+    }
+
     if ($json) {
         print JSON::PP->new->canonical->encode($report), "\n";
     }
