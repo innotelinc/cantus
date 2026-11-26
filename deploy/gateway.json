@@ -13,7 +13,9 @@
     "name": "telno",
     "host": "127.0.0.1",
     "port": 5060,
-    "realm": "telno.tel"
+    "realm": "telno.tel",
+    "user": "cantus-edge",
+    "secret_env": "PEER_SECRET"
   },
   "trunk": {
     "host": "newyork1.voip.ms",

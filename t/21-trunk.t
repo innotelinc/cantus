@@ -34,6 +34,7 @@ my $DID     = '14132642700';
 my $CARRIER_PASSWORD = 'carrier-secret';
 $ENV{GATEWAY_PASSWORD} = 'test123';
 $ENV{TRUNK_SECRET}     = $CARRIER_PASSWORD;
+$ENV{PEER_SECRET}      = 'peer-secret';
 
 sub free_port {
     my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
@@ -303,7 +304,7 @@ package Peer;
 use Socket qw(sockaddr_in inet_aton inet_ntoa);
 
 sub new {
-    my ($class) = @_;
+    my ($class, %a) = @_;
     my $sip = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
                                     Proto => 'udp', ReuseAddr => 1) or die "peer sip: $!";
     my $rtp = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
@@ -315,6 +316,7 @@ sub new {
         port => (sockaddr_in($sip->sockname))[0],
         rtp_port => (sockaddr_in($rtp->sockname))[0],
         invites => [], acks => 0, byes => 0, cancels => 0,
+        challenged => 0, auth_ok => 0, password => $a{password},
         call => undef, to_tag => 'peer1', remote => undef,
         rx_frames => 0, phase => 0, seq => 0, ts => 0,
     }, $class;
@@ -334,6 +336,24 @@ sub _sdp {
     my ($self) = @_;
     return Cantus::Sip::sdp_answer(ip => '127.0.0.1', port => $self->{rtp_port},
                                    codec => 'PCMU', event_pt => 101);
+}
+
+# The softphone hangs up: the switch sends the BYE, and the edge has to pass it
+# on to the carrier rather than leave that leg billed.
+sub hangup {
+    my ($self) = @_;
+    return unless $self->{call} && $self->{gw};
+    my $text = Cantus::Sip::request(
+        method  => 'BYE',
+        uri     => 'sip:' . ($self->{to_user} // '101') . '@' . $self->{gw},
+        via     => '127.0.0.1:' . $self->{port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
+        from    => '<sip:' . ($self->{to_user} // '101') . "\@peer.test>;tag=$self->{to_tag}",
+        to      => '<sip:' . ($self->{from_user} // 'x') . "\@peer.test>;tag=" . ($self->{gw_from_tag} // 'gw'),
+        call_id => $self->{call},
+        cseq    => 2,
+        contact => '<sip:101@127.0.0.1:' . $self->{port} . '>',
+    );
+    $self->_send($text, $self->{gw});
 }
 
 sub pump {
@@ -374,15 +394,46 @@ sub _request {
     my ($self, $msg) = @_;
     my $method = $msg->{method} // '';
     if ($method eq 'INVITE') {
+        # A switch that trusts "it came from loopback" is a switch anything on
+        # the host can call. The edge is challenged like any other trunk.
+        my $auth = Cantus::Sip::header($msg, 'authorization');
+        unless ($auth) {
+            $self->{challenged}++;
+            $self->_send(Cantus::Sip::response($msg, 401,
+                headers => [ Cantus::Sip::challenge_header('peer.test', 'nonce-peer-' . $$) ]),
+                $msg->{src});
+            return;
+        }
+        my ($ok) = Cantus::Sip::verify_digest(
+            msg => $msg, method => 'INVITE',
+            user => 'cantus-edge', password => $self->{password}, realm => 'peer.test',
+        );
+        $self->{auth_ok} = $ok ? 1 : 0;
+        unless ($ok) {
+            $self->_send(Cantus::Sip::response($msg, 403), $msg->{src});
+            return;
+        }
         my $to = Cantus::Sip::parse_uri($msg->{uri});
         my $from = Cantus::Sip::parse_uri(Cantus::Sip::header($msg, 'from'));
+        my $ext = $to ? $to->{user} : undef;
         push @{ $self->{invites} }, {
             call => Cantus::Sip::header($msg, 'call-id'),
-            to   => $to ? $to->{user} : undef,
+            to   => $ext,
             from => $from ? $from->{user} : undef,
         };
         $self->{call} = Cantus::Sip::header($msg, 'call-id');
+        $self->{gw} = $msg->{src};
+        $self->{to_user} = $ext;
+        $self->{from_user} = $from ? $from->{user} : undef;
+        $self->{gw_from_tag} = Cantus::Sip::tag($msg, 'from');
         $self->_send(Cantus::Sip::response($msg, 180, to_tag => $self->{to_tag}), $msg->{src});
+        # One extension refuses, one never picks up, the rest answer: the three
+        # outcomes the gateway has to turn into a carrier response.
+        if ($ext eq '102') {
+            $self->_send(Cantus::Sip::response($msg, 486, to_tag => $self->{to_tag}), $msg->{src});
+            return;
+        }
+        if ($ext eq '103') { return }
         $self->_send(Cantus::Sip::response(
             $msg, 200, to_tag => $self->{to_tag},
             contact => '<sip:101@127.0.0.1:' . $self->{port} . '>',
@@ -427,7 +478,7 @@ my $endpoint = Cantus::Node->new(
 );
 
 my $carrier = Carrier->new(user => '235662_test', password => $CARRIER_PASSWORD);
-my $peer = Peer->new();
+my $peer = Peer->new(password => 'peer-secret');
 
 my $routes_path = "/tmp/cantus-routes-$$.json";
 open my $rfh, '>', $routes_path or die $!;
@@ -448,9 +499,15 @@ print $rfh JSON::PP->new->canonical->encode({
           then => [ { reject => 3 } ] },
         { name => 'did-14135550112-unrouted', when => { to => '14135550112' },
           then => [ { reject => 3 } ] },
-        # A rule that names a SIP target: an extension on the internal peer.
+        # Rules that name a SIP target: extensions on the internal peer.
         { name => 'did-14135550120-sip', when => { to => '14135550120' },
           then => [ { answer => {} }, { forward => { to => 'sip:101' } } ] },
+        { name => 'did-14135550121-sip', when => { to => '14135550121' },
+          then => [ { answer => {} }, { forward => { to => 'sip:101' } } ] },
+        { name => 'did-14135550122-sip', when => { to => '14135550122' },
+          then => [ { answer => {} }, { forward => { to => 'sip:102' } } ] },
+        { name => 'did-14135550123-sip', when => { to => '14135550123' },
+          then => [ { answer => {} }, { forward => { to => 'sip:103' } } ] },
         { name => 'pstn-national', when => { to => '1*' },
           then => [ { forward => { to => 'pstn:' } } ] },
     ],
@@ -466,7 +523,8 @@ my $gateway = Cantus::Gateway->new(
         id => 'gateway@trunk.test', relay => $relay_addr, target => 'node@trunk.test',
         secret => $SECRET, rtp_port => free_port(), ring_timeout => 3, debug => 1,
         accounts => [ { user => '101', id => 'gw-101@trunk.test' } ],
-        peer => { host => '127.0.0.1', port => $peer->port, realm => 'peer.test' },
+        peer => { name => 'test', host => '127.0.0.1', port => $peer->port,
+                  realm => 'peer.test', user => 'cantus-edge', secret_env => 'PEER_SECRET' },
         trunk => {
             host => '127.0.0.1', port => $carrier->port,
             user => '235662_test', secret_env => 'TRUNK_SECRET',
@@ -667,6 +725,39 @@ $carrier->bye_in("127.0.0.1:$sip_port");
 spin(1.0);
 ok($peer->{byes} >= 1, 'hanging up the carrier leg ends the peer leg too');
 
+# The edge is not trusted for being on loopback: the peer challenged it, and
+# the call above only went through because the digest was answered.
+ok($peer->{challenged} >= 1, 'the peer challenged the edge INVITE');
+ok($peer->{auth_ok}, 'and the edge answered with its own secret, not its address');
+
+# ------------------------------------------ the softphone hangs up
+# The direction that was not covered: the switch holding the softphone sends
+# the BYE, and the carrier leg has to be released rather than left up.
+my $byes_before = $carrier->{byes};
+$carrier->invite_in(did => '14135550121', gw => "127.0.0.1:$sip_port");
+spin(2.0);
+is($carrier->{in}{code}, 200, 'a second DID is answered by the peer');
+$peer->hangup;
+spin(1.2);
+cmp_ok($carrier->{byes}, '>', $byes_before, 'the softphone hanging up sends the carrier a BYE');
+my ($hung) = grep { ($_->{from} // '') eq '14135550121' } cdr_events();
+ok($hung, 'and the call is closed in the CDR');
+ok($hung->{answered}, 'as an answered call, not a failed one');
+
+# ------------------------------------------------- a peer that refuses
+$carrier->invite_in(did => '14135550122', gw => "127.0.0.1:$sip_port");
+spin(1.5);
+is($carrier->{in}{code}, 486, 'a refusing peer is passed to the carrier as 486');
+my ($refused_cdr) = grep { ($_->{from} // '') eq '14135550122' } cdr_events();
+ok($refused_cdr, 'the refusal is in the CDR');
+ok(!$refused_cdr->{answered}, 'not as an answered call');
+
+# -------------------------------------------- a peer that never answers
+$carrier->invite_in(did => '14135550123', gw => "127.0.0.1:$sip_port");
+spin(4.5);
+is($carrier->{in}{code}, 408, 'a peer that never answers gives the carrier 408');
+ok($peer->{cancels} >= 1, 'and its leg was cancelled rather than left ringing');
+
 # ---------------------------------------------------------------- outbound
 
 my ($ok, $why) = $phone->invite('4443');
@@ -688,9 +779,10 @@ my $pa = wait_audio($phone, 8);
 cmp_ok($pa->{rx_peak}, '>', 0, "the extension hears the carrier ($pa->{rx_frames} frames)");
 cmp_ok($carrier->{rx_frames} - $rx_before, '>', 5, 'and the carrier hears the extension');
 
+my $byes_at_dial = $carrier->{byes};
 ok($phone->bye, '101 hangs up the carrier call');
 spin(1.0);
-is($carrier->{byes}, 1, 'the carrier is told the call ended');
+is($carrier->{byes} - $byes_at_dial, 1, 'the carrier is told the call ended');
 my ($outbound) = grep { ($_->{line} // '') eq '101' && ($_->{to} // '') eq '4443' } cdr_events();
 ok($outbound, 'the outbound call is in the CDR');
 ok($outbound->{answered}, 'as answered');

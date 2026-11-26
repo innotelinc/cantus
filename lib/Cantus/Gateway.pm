@@ -231,12 +231,19 @@ sub _load_peer {
     my ($self, $p) = @_;
     return unless $p;
     die "gateway: peer needs a host\n" unless $p->{host};
+    my $secret = $ENV{ $p->{secret_env} // 'PEER_SECRET' } // $p->{secret};
+    # A peer that names a secret is a peer that challenges, so a missing one is
+    # a configuration error and not a call to make without credentials.
+    die 'gateway: peer secret missing (set ' . ($p->{secret_env} // 'PEER_SECRET') . ")\n"
+        if $p->{secret_env} && !(defined $secret && length $secret);
     $self->{peer} = {
-        name  => $p->{name} // 'peer',
-        host  => $p->{host},
-        port  => $p->{port} // 5060,
-        realm => $p->{realm} // $p->{host},
-        addr  => $p->{addr} // ($p->{host} . ':' . ($p->{port} // 5060)),
+        name   => $p->{name} // 'peer',
+        host   => $p->{host},
+        port   => $p->{port} // 5060,
+        realm  => $p->{realm} // $p->{host},
+        user   => $p->{user} // 'cantus-edge',
+        secret => $secret,
+        addr   => $p->{addr} // ($p->{host} . ':' . ($p->{port} // 5060)),
     };
 }
 
@@ -1195,6 +1202,33 @@ sub _trunk_auth_header {
     );
 }
 
+# The peer's challenge, answered with the peer's own credentials. It is the
+# same digest the carrier path uses, kept separate because the two accounts are
+# different and neither password belongs in a header meant for the other.
+sub _peer_auth_header {
+    my ($self, $method, $uri, $msg, $code) = @_;
+    my $p = $self->{peer} or return undef;
+    return undef unless defined $p->{secret} && length $p->{secret};
+    my $challenge = Cantus::Sip::header($msg,
+        $code == 407 ? 'proxy-authenticate' : 'www-authenticate');
+    my $c = $self->_digest_challenge($challenge);
+    return undef unless $c->{nonce};
+    my $qop = $c->{qop};
+    $qop = (defined $qop && $qop =~ /\bauth\b/) ? 'auth' : undef;
+    my $realm = $c->{realm} // $p->{realm};
+    my %d = (
+        user => $p->{user}, password => $p->{secret}, realm => $realm,
+        method => $method, uri => $uri, nonce => $c->{nonce},
+        qop => $qop, nc => '00000001', cnonce => 'cantus' . int(rand(1_000_000)),
+    );
+    $d{response} = Cantus::Sip::digest_response(%d);
+    return Cantus::Sip::digest_authorization(
+        user => $p->{user}, realm => $realm, nonce => $c->{nonce},
+        uri => $uri, response => $d{response},
+        qop => $qop, nc => $d{nc}, cnonce => $d{cnonce},
+    );
+}
+
 sub _send_invite {
     my ($self, $d, $auth) = @_;
     my $host  = $d->{uri_host} // $self->{advertise};
@@ -1277,6 +1311,27 @@ sub _on_response {
     my $d = $self->{pending}{$call_id} or return;
     my $code = $msg->{status} // 0;
     return if $code < 200;
+
+    # The internal peer challenges its INVITEs too: being on the loopback is
+    # not a credential, so the same proof the carrier asks for is given here.
+    if (($code == 401 || $code == 407) && $d->{peer_leg} && !$d->{auth_sent}) {
+        my $uri = 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise});
+        my $auth = $self->_peer_auth_header('INVITE', $uri, $msg, $code);
+        unless ($auth) {
+            $self->emit({ kind => 'peer-challenge-missing', code => $code, call => $call_id });
+            delete $self->{pending}{$call_id};
+            if ($d->{peer}) {
+                $self->_reply($d->{peer}{invite}, 480, to_tag => $d->{peer}{to_tag})
+                    if $d->{peer}{invite} && $d->{peer}{state} eq 'ringing';
+            }
+            $self->_end_dialog($d, 'peer challenge', notify => 0);
+            return;
+        }
+        $d->{auth_sent} = 1;
+        $self->emit({ kind => 'peer-invite-challenged', code => $code, call => $call_id });
+        $self->_send_invite($d, $auth);
+        return;
+    }
 
     # A carrier challenges an INVITE the way it challenges a REGISTER: the call
     # has not been refused, it has asked us to prove who we are.  The leg stays
@@ -1433,6 +1488,9 @@ sub _place_peer {
     );
     unless ($pd) { $self->_fail_peer($d, 503); return }
     $pd->{peer_in} = 1;
+    # Marked so a challenge to this leg is answered from the peer's account and
+    # not mistaken for a carrier refusing the call.
+    $pd->{peer_leg} = 1;
     # One call, one CDR: the carrier leg writes it, the bridge leg is the same
     # call seen from the other side.
     $pd->{no_cdr} = 1;
