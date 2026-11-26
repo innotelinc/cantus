@@ -217,6 +217,27 @@ sub _load_trunk {
         contact  => { addr => $self->{trunk}{addr} },
         dialog   => undef,
     };
+
+    $self->_load_peer($cfg->{peer});
+}
+
+# The internal peer: another SIP switch on this network that should receive the
+# DIDs whose rule names a SIP target. It is not a carrier — nothing registers to
+# it, it does not authenticate us, and what answers is one of its extensions.
+# It exists so a routing rule can name an extension that lives in another switch
+# (an Asterisk with a browser softphone on it) without the gateway having to
+# speak that switch's dialplan.
+sub _load_peer {
+    my ($self, $p) = @_;
+    return unless $p;
+    die "gateway: peer needs a host\n" unless $p->{host};
+    $self->{peer} = {
+        name  => $p->{name} // 'peer',
+        host  => $p->{host},
+        port  => $p->{port} // 5060,
+        realm => $p->{realm} // $p->{host},
+        addr  => $p->{addr} // ($p->{host} . ':' . ($p->{port} // 5060)),
+    };
 }
 
 sub _bind_sip {
@@ -528,6 +549,12 @@ sub _timers {
         if ($d->{trunk_out} && (my $pd = $self->{dialogs_by_call}{ $d->{peer_call} // '' })) {
             $self->_reply($pd->{invite}, 408, to_tag => $pd->{to_tag}) if $pd->{invite};
             $self->_end_dialog($pd, 'carrier no answer', notify => 0);
+        }
+        # The internal switch never picked up: the carrier gets a final
+        # response rather than a call that stops making noise.
+        if ($d->{peer_in} && (my $cd = $d->{peer})) {
+            $self->_reply($cd->{invite}, 408, to_tag => $cd->{to_tag})
+                if $cd->{invite} && $cd->{state} eq 'ringing';
         }
         $self->_end_dialog($d, 'no answer', notify => 0);
     }
@@ -923,12 +950,20 @@ sub _trunk_invite {
 
     my ($fwd) = grep { ref $_ eq 'HASH' && $_->{forward} } @{ $dec->{actions} || [] };
     my $dest = $fwd && ref $fwd->{forward} eq 'HASH' ? $fwd->{forward}{to} : undef;
-    my ($aor, $route);
+    my ($aor, $route, $peer_ext);
     if (defined $dest && $dest =~ /^ext:(.+)$/ && $self->{lines}{$1}) {
         $aor   = $self->{lines}{$1}{id};
         $route = $dec->{route};
     }
-    unless ($aor) {
+    # A `sip:` target names an extension on the internal peer. It is a different
+    # kind of answer from `ext:`, which is a line this gateway can reach over
+    # Cantus: this one is placed over SIP, because the switch holding the
+    # extension is a SIP PBX.
+    elsif (defined $dest && $dest =~ /^sip:([0-9A-Za-z_.+-]+)$/ && $self->{peer}) {
+        $peer_ext = $1;
+        $route    = $dec->{route};
+    }
+    unless ($aor || defined $peer_ext) {
         my ($reject) = grep { ref $_ eq 'HASH' && exists $_->{reject} } @{ $dec->{actions} || [] };
         my $code = $self->_did_reject_code($reject ? $reject->{reject} : 3);
         $self->emit({ kind => 'trunk-rejected-did', call => $call_id, did => $did,
@@ -951,16 +986,18 @@ sub _trunk_invite {
         from_tag  => Cantus::Sip::tag($msg, 'from') // 'carrier',
         codec     => $sdp->{codec}, event_pt => $sdp->{event_pt},
         phone_placed => 0, trunk_in => 1,
-        from_user => $did, to_user => $aor, target_aor => $aor,
+        from_user => $did, to_user => ($aor // $peer_ext), target_aor => $aor,
         addr      => $msg->{src},   # replies and BYE go where the call came from
     ) or do { $self->_reply($msg, 503); return };
     $d->{invite} = $msg;
     $d->{remote} = "$sdp->{ip}:$sdp->{port}";
     $self->_reply($msg, 180, to_tag => $d->{to_tag});
     $self->emit({ kind => 'trunk-invite', call => $call_id, did => $did,
-                  to => $aor, codec => $d->{codec},
+                  to => ($aor // $peer_ext), codec => $d->{codec},
+                  (defined $peer_ext ? (peer => $self->{peer}{name}) : ()),
                   (defined $route ? (route => $route) : ()) });
-    $self->_place($line, $d);
+    if (defined $peer_ext) { $self->_place_peer($line, $d, $peer_ext) }
+    else                   { $self->_place($line, $d) }
 }
 
 # An extension dialled a number.  The routing document decides whether it may
@@ -1084,7 +1121,10 @@ sub _new_dialog {
         $d->{route}     = $a{route};
         $d->{trunk_in}  = $a{trunk_in}  ? 1 : 0;
         $d->{trunk_out} = $a{trunk_out} ? 1 : 0;
-        $line->{dialog} = $d;
+        # A bridge leg is not the line's own call: the trunk line already holds
+        # the carrier dialog, and pointing it at the leg we just added would
+        # lose the call the line is actually on.
+        $line->{dialog} = $d unless $a{no_line};
     $self->{dialogs_by_call}{ $d->{call_id} } = $d;
     return $d;
 }
@@ -1273,6 +1313,14 @@ sub _on_response {
         if (my $s = $self->_session_of($d)) {
             $line->{node}->reject($s, Cantus::Session::reason_id('UNAVAILABLE'));
         }
+        # A bridge leg's refusal is the carrier's refusal: it is still waiting
+        # for a final response, and a call that just goes quiet is one the
+        # carrier retransmits until it times out.
+        if ($d->{peer_in} && (my $cd = $d->{peer})) {
+            $self->_reply($cd->{invite}, $code == 486 ? 486 : ($code == 404 ? 404 : 480),
+                          to_tag => $cd->{to_tag})
+                if $cd->{invite} && $cd->{state} eq 'ringing';
+        }
         $self->_fail_peer($d, $code == 486 ? 486 : ($code == 408 ? 408 : 480));
         $self->_end_dialog($d, "phone $code", notify => 0);
         return;
@@ -1291,6 +1339,23 @@ sub _on_response {
     $self->emit({ kind => 'answered', call => $call_id, line => $line->{user},
                   codec => $d->{codec}, remote => $d->{remote},
                   rtp_port => $d->{rtp_port} });
+
+    # The internal peer answered. The carrier has been told 180 since the DID
+    # arrived; only now can it be told 200, and only now is there a bridge to
+    # send audio across.
+    if ($d->{peer_in}) {
+        my $cd = $d->{peer};
+        if ($cd && $cd->{state} eq 'ringing' && $cd->{invite}) {
+            $cd->{state} = 'active';
+            $cd->{answered_at} = time;
+            $self->_reply($cd->{invite}, 200, to_tag => $cd->{to_tag},
+                          contact => $self->_contact($cd->{line}), sdp => $cd->{sdp});
+            $self->emit({ kind => 'answered', call => $cd->{call_id}, line => $cd->{line}{user},
+                          to => $d->{to_user}, route => $cd->{route}, codec => $d->{codec},
+                          remote => $d->{remote}, rtp_port => $cd->{rtp_port} });
+        }
+        return;
+    }
 
     # An outbound carrier leg: the phone has been rung but the call is not up
     # until the carrier answers, so its 200 is answered now, with our SDP.
@@ -1349,6 +1414,39 @@ sub _place {
     $d->{session} = $call;
 }
 
+# An inbound leg whose rule names a SIP extension: one INVITE to the peer, and
+# the carrier is not answered until that extension answers. The bridge itself is
+# the same one an outbound call uses — each leg sends what the other received.
+sub _place_peer {
+    my ($self, $line, $d, $ext) = @_;
+    my $p = $self->{peer};
+    unless ($p) {
+        $self->emit({ kind => 'peer-missing', call => $d->{call_id}, to => $ext });
+        $self->_fail_peer($d, 503);
+        return;
+    }
+    my $pd = $self->_new_dialog($line,
+        outbound  => 1, no_line => 1,
+        from_user => $d->{from_user}, to_user => $ext,
+        uri_host  => $p->{host}, sip_realm => $p->{realm}, addr => $p->{addr},
+        peer_call => $d->{call_id}, route => $d->{route},
+    );
+    unless ($pd) { $self->_fail_peer($d, 503); return }
+    $pd->{peer_in} = 1;
+    # One call, one CDR: the carrier leg writes it, the bridge leg is the same
+    # call seen from the other side.
+    $pd->{no_cdr} = 1;
+    $pd->{peer} = $d;
+    $d->{peer}  = $pd;
+    $pd->{ring_deadline} = time + $self->{ring_timeout};
+    $self->{pending}{ $pd->{call_id} } = $pd;
+    $self->_send_invite($pd);
+    $self->emit({ kind => 'peer-invite', call => $pd->{call_id}, did => $d->{from_user},
+                  to => $ext, host => $p->{host}, peer => $p->{name},
+                  route => $d->{route} });
+    return 1;
+}
+
 sub _fail_peer {
     my ($self, $d, $code) = @_;
     return unless $d && $d->{invite};
@@ -1386,6 +1484,9 @@ sub _end_dialog {
 # when someone asks for it is a CDR that is missing when it matters.
 sub _cdr {
     my ($self, $d, $result) = @_;
+    # A bridge leg is one call seen from the other side; the carrier leg writes
+    # the only record of it.
+    return if $d->{no_cdr};
     my $rec = {
         kind      => 'cdr',
         call      => $d->{call_id},

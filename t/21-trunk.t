@@ -292,6 +292,119 @@ sub _rtp {
     $self->{ts} += 160;
 }
 
+# ---------------------------------------------------------------- the peer
+#
+# The internal switch, the way Asterisk answers a call addressed to `sip:101`:
+# nothing authenticates it, one extension answers, and its media is an echo, so
+# a frame that crosses the gateway comes back as audio.
+
+package Peer;
+
+use Socket qw(sockaddr_in inet_aton inet_ntoa);
+
+sub new {
+    my ($class) = @_;
+    my $sip = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
+                                    Proto => 'udp', ReuseAddr => 1) or die "peer sip: $!";
+    my $rtp = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
+                                    Proto => 'udp', ReuseAddr => 1) or die "peer rtp: $!";
+    $sip->blocking(0);
+    $rtp->blocking(0);
+    return bless {
+        sip => $sip, rtp => $rtp,
+        port => (sockaddr_in($sip->sockname))[0],
+        rtp_port => (sockaddr_in($rtp->sockname))[0],
+        invites => [], acks => 0, byes => 0, cancels => 0,
+        call => undef, to_tag => 'peer1', remote => undef,
+        rx_frames => 0, phase => 0, seq => 0, ts => 0,
+    }, $class;
+}
+
+sub port { $_[0]{port} }
+sub addr { '127.0.0.1:' . $_[0]{port} }
+
+sub _send {
+    my ($self, $text, $to) = @_;
+    my ($ip, $port) = split /:/, $to, 2;
+    return unless $ip && $port;
+    CORE::send($self->{sip}, $text, 0, sockaddr_in($port, inet_aton($ip)));
+}
+
+sub _sdp {
+    my ($self) = @_;
+    return Cantus::Sip::sdp_answer(ip => '127.0.0.1', port => $self->{rtp_port},
+                                   codec => 'PCMU', event_pt => 101);
+}
+
+sub pump {
+    my ($self) = @_;
+    while (1) {
+        my $buf;
+        my $from = recv($self->{sip}, $buf, 65535, 0);
+        last unless defined $from && length $buf;
+        my ($port, $iaddr) = sockaddr_in($from);
+        my $msg = Cantus::Sip::parse($buf) or next;
+        $msg->{src} = inet_ntoa($iaddr) . ':' . $port;
+        $self->_request($msg) if $msg->{request};
+    }
+    while (1) {
+        my $buf;
+        my $from = recv($self->{rtp}, $buf, 4096, 0);
+        last unless defined $from && length $buf;
+        my ($port, $iaddr) = sockaddr_in($from);
+        my $pkt = Cantus::Sip::rtp_parse($buf) or next;
+        next unless $pkt->{pt} == 0;
+        next unless length Cantus::G711::mu_to_pcm($pkt->{payload});
+        $self->{remote} = inet_ntoa($iaddr) . ':' . $port;
+        $self->{rx_frames}++;
+    }
+    return unless $self->{call} && $self->{remote};
+    my ($pcm, $phase) = Cantus::Media::pcm_frame(hz => 440, amp => 6000, phase => $self->{phase});
+    $self->{phase} = $phase;
+    my $payload = Cantus::G711::pcm_to_mu($pcm);
+    my ($ip, $port) = split /:/, $self->{remote}, 2;
+    CORE::send($self->{rtp},
+        Cantus::Sip::rtp_build(pt => 0, seq => $self->{seq}++, ts => $self->{ts},
+                               ssrc => 0xBEEF, payload => $payload),
+        0, sockaddr_in($port, inet_aton($ip)));
+    $self->{ts} += 160;
+}
+
+sub _request {
+    my ($self, $msg) = @_;
+    my $method = $msg->{method} // '';
+    if ($method eq 'INVITE') {
+        my $to = Cantus::Sip::parse_uri($msg->{uri});
+        my $from = Cantus::Sip::parse_uri(Cantus::Sip::header($msg, 'from'));
+        push @{ $self->{invites} }, {
+            call => Cantus::Sip::header($msg, 'call-id'),
+            to   => $to ? $to->{user} : undef,
+            from => $from ? $from->{user} : undef,
+        };
+        $self->{call} = Cantus::Sip::header($msg, 'call-id');
+        $self->_send(Cantus::Sip::response($msg, 180, to_tag => $self->{to_tag}), $msg->{src});
+        $self->_send(Cantus::Sip::response(
+            $msg, 200, to_tag => $self->{to_tag},
+            contact => '<sip:101@127.0.0.1:' . $self->{port} . '>',
+            sdp => $self->_sdp,
+        ), $msg->{src});
+        return;
+    }
+    if ($method eq 'ACK') { $self->{acks}++; return }
+    if ($method eq 'BYE') {
+        $self->{byes}++;
+        $self->_send(Cantus::Sip::response($msg, 200), $msg->{src});
+        $self->{call} = undef;
+        return;
+    }
+    if ($method eq 'CANCEL') {
+        $self->{cancels}++;
+        $self->_send(Cantus::Sip::response($msg, 200), $msg->{src});
+        return;
+    }
+    $self->_send(Cantus::Sip::response($msg, 405), $msg->{src});
+}
+
 package main;
 
 # ---------------------------------------------------------------- the network
@@ -314,6 +427,7 @@ my $endpoint = Cantus::Node->new(
 );
 
 my $carrier = Carrier->new(user => '235662_test', password => $CARRIER_PASSWORD);
+my $peer = Peer->new();
 
 my $routes_path = "/tmp/cantus-routes-$$.json";
 open my $rfh, '>', $routes_path or die $!;
@@ -334,6 +448,9 @@ print $rfh JSON::PP->new->canonical->encode({
           then => [ { reject => 3 } ] },
         { name => 'did-14135550112-unrouted', when => { to => '14135550112' },
           then => [ { reject => 3 } ] },
+        # A rule that names a SIP target: an extension on the internal peer.
+        { name => 'did-14135550120-sip', when => { to => '14135550120' },
+          then => [ { answer => {} }, { forward => { to => 'sip:101' } } ] },
         { name => 'pstn-national', when => { to => '1*' },
           then => [ { forward => { to => 'pstn:' } } ] },
     ],
@@ -349,6 +466,7 @@ my $gateway = Cantus::Gateway->new(
         id => 'gateway@trunk.test', relay => $relay_addr, target => 'node@trunk.test',
         secret => $SECRET, rtp_port => free_port(), ring_timeout => 3, debug => 1,
         accounts => [ { user => '101', id => 'gw-101@trunk.test' } ],
+        peer => { host => '127.0.0.1', port => $peer->port, realm => 'peer.test' },
         trunk => {
             host => '127.0.0.1', port => $carrier->port,
             user => '235662_test', secret_env => 'TRUNK_SECRET',
@@ -410,6 +528,7 @@ sub spin {
     my $until = time + $seconds;
     while (time < $until) {
         $carrier->pump;
+        $peer->pump;
         $phone->pump_tick if $phone;
         sleep 0.002;
     }
@@ -522,6 +641,31 @@ is($carrier->{in}{code}, 403, 'an unknown number takes the document default');
 my $unknown = did_event('trunk-rejected-did', '9999999999', 1);
 ok($unknown, 'and is logged as rejected, not as a routing failure');
 ok(!defined $unknown->{route}, 'with no route name, because none matched');
+
+# ------------------------------------------------- inbound DID to the peer
+#
+# A rule that names `sip:101` sends the call to the internal switch instead of a
+# Cantus line: the carrier is answered only once that switch answers, and the
+# two legs bridge audio both ways.
+
+my $carrier_rx_before = $carrier->{rx_frames};
+$carrier->invite_in(did => '14135550120', gw => "127.0.0.1:$sip_port");
+my $peer_iv = did_event('peer-invite', '14135550120', 3);
+ok($peer_iv, 'a sip: target places a leg to the internal peer');
+is($peer_iv->{to}, '101', 'addressed to the extension the rule named');
+is($peer_iv->{host}, '127.0.0.1', 'at the configured peer host');
+
+spin(2.0);
+is($carrier->{in}{code}, 200, 'the carrier is answered once the peer answers');
+ok(@{ $peer->{invites} } >= 1, 'the peer saw the INVITE');
+is($peer->{invites}[-1]{to}, '101', 'for extension 101');
+ok($peer->{acks} >= 1, 'and the gateway ACKed the peer 200');
+cmp_ok($peer->{rx_frames}, '>', 0, 'carrier audio crossed the gateway to the peer');
+cmp_ok($carrier->{rx_frames} - $carrier_rx_before, '>', 0, 'and peer audio came back');
+
+$carrier->bye_in("127.0.0.1:$sip_port");
+spin(1.0);
+ok($peer->{byes} >= 1, 'hanging up the carrier leg ends the peer leg too');
 
 # ---------------------------------------------------------------- outbound
 

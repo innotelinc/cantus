@@ -9,6 +9,12 @@
   ],
   "relay": "127.0.0.1:7443",
   "target": "node@switch.example",
+  "peer": {
+    "name": "telno",
+    "host": "127.0.0.1",
+    "port": 5060,
+    "realm": "telno.tel"
+  },
   "trunk": {
     "host": "newyork1.voip.ms",
     "port": 5060,
