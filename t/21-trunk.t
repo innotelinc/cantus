@@ -323,6 +323,11 @@ print $rfh JSON::PP->new->canonical->encode({
     routes  => [
         { name => 'carrier-echo', when => { to => '4443' },
           then => [ { forward => { to => 'pstn:4443' } } ] },
+        # The ten-digit form of the DID. A carrier picks one form or the other,
+        # and `trunk.dids` below deliberately keeps only the eleven-digit key so
+        # the inbound path has to ask the document.
+        { name => 'did-4132642700', when => { to => '4132642700' },
+          then => [ { answer => {} }, { forward => { to => 'ext:101' } } ] },
         { name => 'pstn-national', when => { to => '1*' },
           then => [ { forward => { to => 'pstn:' } } ] },
     ],
@@ -477,6 +482,25 @@ my $invites_before = scalar @{ $carrier->{invites} };
 $carrier->invite_in(did => '9999999999', gw => "127.0.0.1:$sip_port");
 spin(1.2);
 is($carrier->{in}{code}, 404, 'a DID that is not configured is 404, not routed somewhere');
+
+# ------------------------------------------------- DID from the document
+
+# The same number in the form the carrier actually sends. `dids` has no entry
+# for it; the routing document does, and its target is a line, not a node.
+$carrier->invite_in(did => '4132642700', gw => "127.0.0.1:$sip_port");
+# The log already holds the earlier DID's trunk-invite, so pick by the number
+# rather than taking the first event of that kind.
+my $ten;
+my $ten_deadline = time + 3;
+while (time < $ten_deadline && !$ten) {
+    spin(0.2);
+    ($ten) = grep { ($_->{did} // '') eq '4132642700' } events_of('trunk-invite');
+}
+ok($ten, 'the ten-digit DID is accepted when the document names it');
+is($ten->{to}, 'gw-101@trunk.test', 'and forwarded to the line the document names');
+is($ten->{route}, 'did-4132642700', 'quoting the route that matched');
+$carrier->bye_in("127.0.0.1:$sip_port");
+spin(0.6);
 
 # ---------------------------------------------------------------- outbound
 

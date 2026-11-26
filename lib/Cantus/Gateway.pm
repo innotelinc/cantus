@@ -905,6 +905,20 @@ sub _trunk_invite {
     my $did = $to && defined $to->{user} ? $to->{user} : '';
     $did =~ s/^\+//;
     my $aor = $t->{dids}{$did} // $t->{dids}{ '+' . $did };
+    my $route;
+    # A carrier may send a North American number in either form, and the routing
+    # document carries both. `dids` is the older map and can name only one of
+    # them; asking the document keeps the inbound path and the rules the operator
+    # can see from disagreeing about the same number.
+    if (!$aor && $t->{router}) {
+        my $dec = $t->{router}->decide({ to => $did, verified => 1 });
+        my ($fwd) = grep { ref $_ eq 'HASH' && $_->{forward} } @{ $dec->{actions} || [] };
+        my $dest = $fwd && ref $fwd->{forward} eq 'HASH' ? $fwd->{forward}{to} : undef;
+        if (defined $dest && $dest =~ /^ext:(.+)$/ && $self->{lines}{$1}) {
+            $aor   = $self->{lines}{$1}{id};
+            $route = $dec->{route};
+        }
+    }
     unless ($aor) {
         $self->emit({ kind => 'trunk-unknown-did', call => $call_id, did => $did, src => $msg->{src} });
         $self->_reply($msg, 404);
@@ -932,7 +946,8 @@ sub _trunk_invite {
     $d->{remote} = "$sdp->{ip}:$sdp->{port}";
     $self->_reply($msg, 180, to_tag => $d->{to_tag});
     $self->emit({ kind => 'trunk-invite', call => $call_id, did => $did,
-                  to => $aor, codec => $d->{codec} });
+                  to => $aor, codec => $d->{codec},
+                  (defined $route ? (route => $route) : ()) });
     $self->_place($line, $d);
 }
 
