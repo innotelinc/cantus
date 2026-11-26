@@ -78,8 +78,8 @@ opposite, so both roles also run as long-lived processes, each reading one JSON
 file and holding one port:
 
 ```bash
-perl -Ilib bin/cantus relay --config examples/relay.json    # 7443/udp, registry + forwarder
-perl -Ilib bin/cantus node  --config examples/node.json     # 7443/udp, registers with the relay
+perl -Ilib bin/cantus relay --config examples/relay.json    # 7443/udp + 7443/tcp, registry + forwarder
+perl -Ilib bin/cantus node  --config examples/node.json     # registers with the relay over UDP, TCP if UDP is blocked
 ```
 
 They print one JSON event per line — `ready`, `registered`, `stats`, `stopped` —
@@ -232,6 +232,13 @@ Deliberate, and stated so nobody mistakes a reference stack for a deployment:
   a congestion controller.
 - **No T.38, no in-band DTMF, no dialplan** — by design.
 - **Bind default** is `127.0.0.1:0`; pass `bind => '0.0.0.0:7443'` for a real node.
+- **Both bindings on 7443.** The relay listens on UDP and TCP on the same port,
+  and the node registers over UDP, retrying once over TCP when no `REGISTER_ACK`
+  arrives in 1.2 s (§8.8). A TCP registration is delivered down its connection,
+  not to an address, and it is dropped the moment UDP answers again. Set
+  `relay_transport` to `udp` or `tcp` to pin one binding; the default is `auto`.
+  The relay also accepts `tcp: false` / `udp: false`, which is how the fallback
+  is tested with UDP genuinely absent.
 - **The Asterisk tarball is not committed** (26 MB, reproducibly downloadable);
   its SHA-256 is in the findings doc.
 
@@ -277,17 +284,3 @@ Cerulean Vault owns secrets, Cerulean owns trust, ONYX owns storage, Magnate own
 revenue, NPM Edge owns the edge, and every other platform is a business function
 that consumes them. See [docs/stack.md](docs/stack.md) for this platform's
 owns/consumes boundaries.
-
-## Run it as a service
-
-Two services from one image: a relay a symmetric NAT can reach, and a node that
-holds a call.
-
-    CANTUS_SECRET=... docker compose up -d
-
-The relay publishes `7443/udp`; the node registers with it and is reached through
-it. Each container's health check is `cantus health --config … --json`, which
-places a real call behind a symmetric NAT, flushes the mapping mid-call, and exits
-non-zero unless the relay carried the call and the audio survived. With
-`--config` it also fails when nothing is listening on the configured socket, so a
-dead daemon cannot report healthy.

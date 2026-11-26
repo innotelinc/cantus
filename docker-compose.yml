@@ -4,8 +4,10 @@
 #
 #   CANTUS_SECRET=... docker compose up -d
 #
-# The relay publishes 7443/udp because that is the socket endpoints dial. The node
-# does not: it registers with the relay and is reached through it.
+# The relay publishes 7443 twice because that is the port endpoints dial: UDP is
+# the baseline binding and TCP is the fallback a NAT that drops UDP has to be
+# able to reach (spec §4.2, §8.8). The node publishes neither: it registers with
+# the relay and is reached through it.
 services:
   cantus-relay:
     image: ${CANTUS_IMAGE:-ghcr.io/innotelinc/cantus:main}
@@ -15,6 +17,7 @@ services:
       CANTUS_SECRET: ${CANTUS_SECRET:?set CANTUS_SECRET in .env}
     ports:
       - "7443:7443/udp"
+      - "7443:7443/tcp"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "perl", "-Ilib", "bin/cantus", "health", "--config", "deploy/relay.json", "--json"]

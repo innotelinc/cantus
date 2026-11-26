@@ -6,7 +6,7 @@
 FROM perl:5.40-slim
 
 LABEL org.opencontainers.image.title="cantus-node"
-LABEL org.opencontainers.image.description="Cantus 1.0 node and relay: one UDP socket on 7443"
+LABEL org.opencontainers.image.description="Cantus 1.0 node and relay: 7443/udp with a 7443/tcp fallback"
 LABEL org.opencontainers.image.source="https://github.com/innotelinc/cantus"
 
 WORKDIR /opt/cantus

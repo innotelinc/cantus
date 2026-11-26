@@ -240,6 +240,35 @@ sub kind {
     return ord(substr($data, 1, 1));
 }
 
+# ------------------------------------------------------------- tcp framing
+
+# §4.2: the fallback binding carries the same datagrams on one TCP connection,
+# each prefixed by a 2-octet big-endian length.  Nothing else changes, which is
+# why a datagram built for UDP is sent as-is inside the frame.
+sub frame_encode {
+    my ($datagram) = @_;
+    die "cantus: frame larger than 65535 octets\n" if length($datagram) > 65535;
+    return pack('n', length($datagram)) . $datagram;
+}
+
+# TCP hands a reader whatever arrived, so decoding is incremental: return every
+# whole frame in the buffer plus the tail that is still incomplete.  A reader
+# that assumed one frame per read would drop the rest of a burst.
+sub frame_decode {
+    my ($buffer) = @_;
+    my @frames;
+    my $pos = 0;
+    my $len = length($buffer // '');
+    while ($len - $pos >= 2) {
+        my $size = unpack('n', substr($buffer, $pos, 2));
+        last if $len - $pos - 2 < $size;
+        my $body = substr($buffer, $pos + 2, $size);
+        $pos += 2 + $size;
+        push @frames, $body if defined kind($body);
+    }
+    return (\@frames, substr($buffer, $pos));
+}
+
 # ---------------------------------------------------------------- signatures
 
 # Canonical signing input, section 10.2.  Field 5 (sig) is excluded.

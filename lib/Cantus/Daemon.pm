@@ -73,6 +73,11 @@ sub new {
             secret   => $secret,
             on_event => $on_event,
             ttl      => $cfg->{registration_ttl} // 60,
+            # The same port, twice: UDP is the baseline and TCP is the fallback
+            # an endpoint reaches for when its NAT drops UDP (§4.2, §8.8).
+            udp      => $cfg->{udp} // 1,
+            tcp      => $cfg->{tcp} // 1,
+            tcp_bind => $cfg->{tcp_bind},
             debug    => $cfg->{debug} // 0,
         );
     } else {
@@ -97,6 +102,7 @@ sub new {
             ring_delay  => $cfg->{ring_delay} // 0,
             tone_hz     => $cfg->{tone_hz} // 440,
             debug       => $cfg->{debug} // 0,
+            relay_transport => $cfg->{relay_transport} // 'auto',
             on_event    => $on_event,
         );
     }
@@ -130,6 +136,7 @@ sub run {
     $SIG{INT} = $SIG{TERM} = sub { $self->{running} = 0 };
 
     my %ready = (kind => 'ready', addr => $svc->addr, bind => $self->{cfg}{bind} // DEFAULT_BIND);
+    $ready{tcp} = $svc->tcp_port if $role eq 'relay' && $svc->can('tcp_port') && $svc->tcp_port;
     $ready{id} = $svc->id if $role eq 'node';
     $ready{relay} = $self->{cfg}{relay} if $role eq 'node' && $self->{cfg}{relay};
     $ready{routes} = $self->{cfg}{routes} if $role eq 'node' && $self->{cfg}{routes};

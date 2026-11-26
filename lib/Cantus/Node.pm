@@ -25,6 +25,7 @@ use constant {
     T_REACH     => 0.300,
     T_REBIND    => 2.0,        # safety net: silence this long is always a break
     T_REBIND_FAST => 0.400,    # silence this long while the peer is still reporting
+    T_TCP_FALLBACK => 1.2,     # a REGISTER unanswered this long retries over TCP (§8.8)
     FB_LIVE     => 1.0,        # a report newer than this means the peer is alive
     SEND_STALL  => 16,         # frames sent since the peer last confirmed receiving any
     REFRESH     => 20,
@@ -60,6 +61,15 @@ sub new {
         require_sig => $a{require_sig} // 1,
         log         => [],
         via         => $a{via},
+        # 'auto' is the spec's behaviour: UDP first, TCP only when UDP goes
+        # unanswered.  'udp' and 'tcp' exist so a deployment can be told which
+        # binding to use, which is also how the fallback is tested end to end.
+        relay_transport => $a{relay_transport} // 'auto',
+        transport       => 'udp',
+        tcp             => undef,
+        tcp_buf         => '',
+        tcp_out         => '',
+        last_ack_at     => 0,
         handle      => 0,
         observed    => undef,
         ready       => 0,
@@ -111,7 +121,8 @@ sub stats {
         received_frames => $s->{received_frames},
         receive_peak    => $s->{receive_peak},
         relay_frames    => $s->{relay_frames},
-        direct_frames   => $s->{direct_frames},
+                direct_frames => $s->{direct_frames},
+        transport       => $s->{transport},
         handle          => $s->{handle},
         observed        => $s->{observed},
     };
@@ -127,6 +138,74 @@ sub emit {
 sub stop { $_[0]{running} = 0 }
 
 # ------------------------------------------------------------------ transport
+
+# ------------------------------------------------------------ tcp fallback
+
+# §8.8: a REGISTER that gets no reply over UDP retries once over TCP, and that
+# connection then carries the relay traffic.  UDP stays the committed transport:
+# the moment an ACK arrives over UDP again the connection is closed, because a
+# fallback that quietly becomes the path is how a blocked port stops being
+# noticed.
+sub _tcp_open {
+    my ($self) = @_;
+    return $self->{tcp} if $self->{tcp};
+    my ($ip, $port) = split /:/, ($self->{relay} // ''), 2;
+    return undef unless defined $port;
+    my $conn = IO::Socket::INET->new(
+        PeerAddr => $ip, PeerPort => $port, Proto => 'tcp', Timeout => 2,
+    ) or do {
+        $self->emit({ kind => 'transport-error', transport => 'tcp', error => "$!" });
+        return undef;
+    };
+    $conn->blocking(0);
+    $self->{tcp} = $conn;
+    $self->{tcp_buf} = '';
+    $self->{tcp_out} = '';
+    $self->emit({ kind => 'transport', transport => 'tcp', reason => 'udp-unanswered' });
+    return $conn;
+}
+
+sub _tcp_close {
+    my ($self) = @_;
+    return unless $self->{tcp};
+    close $self->{tcp};
+    $self->{tcp} = undef;
+    $self->{tcp_buf} = '';
+    $self->{tcp_out} = '';
+    $self->emit({ kind => 'transport', transport => 'udp', reason => 'udp-answered' });
+}
+
+sub _tcp_write {
+    my ($self, $bytes) = @_;
+    return 0 unless $self->{tcp};
+    $self->{tcp_out} .= Cantus::Wire::frame_encode($bytes);
+    my $n = syswrite($self->{tcp}, $self->{tcp_out});
+    if (!defined $n) {
+        $self->_tcp_close;
+        $self->{transport} = 'udp';
+        return 0;
+    }
+    substr($self->{tcp_out}, 0, $n, '');
+    return 1;
+}
+
+sub _tcp_read {
+    my ($self) = @_;
+    my $chunk;
+    my $n = sysread($self->{tcp}, $chunk, 65535);
+    unless (defined $n && $n > 0) {
+        $self->_tcp_close;
+        $self->{transport} = 'udp';
+        $self->register;
+        return;
+    }
+    $self->{tcp_buf} .= $chunk;
+    my ($frames, $rest) = Cantus::Wire::frame_decode($self->{tcp_buf});
+    $self->{tcp_buf} = $rest;
+    for my $body (@$frames) {
+        $self->handle_datagram($body, $self->{relay}, 1);
+    }
+}
 
 sub sendto {
     my ($self, $dest, $bytes) = @_;
@@ -146,7 +225,16 @@ sub inject {
 
 sub _relay_send {
     my ($self, $route, $name, $inner) = @_;
-    $self->sendto($self->{relay}, Cantus::Wire::relay_encode($route, $inner, $name));
+    my $datagram = Cantus::Wire::relay_encode($route, $inner, $name);
+    if ($self->{transport} eq 'tcp' && $self->{tcp}) {
+        return 1 if $self->_tcp_write($datagram);
+        # The connection died under us; the UDP socket is still bound, so the
+        # next REGISTER re-decides instead of leaving the call silent.
+        $self->register;
+        return 0;
+    }
+    $self->sendto($self->{relay}, $datagram);
+    return 1;
 }
 
 # -------------------------------------------------------------------- timers
@@ -186,8 +274,7 @@ sub pump {
     my ($self, $seconds) = @_;
     my $until = Cantus::Pump::deadline($seconds);
     my $drain = Cantus::Pump::is_drain($seconds);
-    my $sel = IO::Select->new($self->{sock});
-    while ($self->{running}) {
+        while ($self->{running}) {
         last if Cantus::Pump::expired($seconds, $until);
         $self->fire_timers;
         $self->keepalive_tick if time >= $self->{next_keepalive};
@@ -201,14 +288,20 @@ sub pump {
             my $left = $until - time;
             $wait = $left if $left < $wait;
         }
+        # Rebuilt each slice: the TCP fallback can be opened or closed by a
+        # timer between two waits, and a select set that outlives its socket
+        # is a select set that either spins or misses the connection.
+        my $sel = IO::Select->new($self->{sock});
+        $sel->add($self->{tcp}) if $self->{tcp};
         my @r = $sel->can_read($drain ? 0 : ($wait > 0 ? $wait : 0));
         last if Cantus::Pump::finished($seconds, \@r);
-        $self->recv_one for @r;
+        $self->recv_one($_) for @r;
     }
 }
 
 sub recv_one {
-    my ($self) = @_;
+    my ($self, $fh) = @_;
+    return $self->_tcp_read if $self->{tcp} && $fh && $fh == $self->{tcp};
     my $buf;
     my $peer = recv($self->{sock}, $buf, 65535, 0);
     return unless defined $peer && length $buf;
@@ -319,9 +412,8 @@ sub _obs_port { my ($s) = @_; my (undef, $p) = split /:/, $s->{observed} // $s->
 
 # ------------------------------------------------------------- registration
 
-sub register {
+sub _register_message {
     my ($self) = @_;
-    return unless $self->{relay};
     my $f = {
         21 => Cantus::Wire::S('cantus/1'),
         11 => Cantus::Wire::S($self->{id}),
@@ -329,8 +421,41 @@ sub register {
         24 => Cantus::Wire::B($self->{ident}->public_key),
         10 => Cantus::Wire::B($self->_limits_bytes),
     };
-    $self->sendto($self->{relay}, $self->make_message(13, $f));
-    $self->emit({ kind => 'register-sent', relay => $self->{relay} });
+    return $self->make_message(13, $f);
+}
+
+sub register {
+    my ($self) = @_;
+    return unless $self->{relay};
+    my $msg = $self->_register_message;
+
+    if (($self->{relay_transport} // 'auto') eq 'tcp') {
+        if ($self->_tcp_open) {
+            $self->{transport} = 'tcp';
+            $self->_tcp_write($msg);
+            $self->emit({ kind => 'register-sent', relay => $self->{relay}, transport => 'tcp' });
+        }
+        return;
+    }
+
+    $self->sendto($self->{relay}, $msg);
+    $self->emit({ kind => 'register-sent', relay => $self->{relay}, transport => 'udp' });
+
+    return unless ($self->{relay_transport} // 'auto') eq 'auto';
+    $self->cancel('tcp-fallback');
+    $self->after(T_TCP_FALLBACK, sub { $self->_tcp_fallback }, 'tcp-fallback');
+}
+
+sub _tcp_fallback {
+    my ($self) = @_;
+    return unless $self->{running};
+    return if $self->{tcp};
+    # An ACK since the UDP REGISTER went out means nothing is blocked.
+    return if $self->{last_ack_at} && (time - $self->{last_ack_at}) < T_TCP_FALLBACK;
+    return unless $self->_tcp_open;
+    $self->{transport} = 'tcp';
+    $self->_tcp_write($self->_register_message);
+    $self->emit({ kind => 'register-sent', relay => $self->{relay}, transport => 'tcp' });
 }
 
 sub _schedule_refresh {
@@ -413,7 +538,7 @@ sub _on_hello {
 sub _on_hello_ack { }
 
 sub _on_register_ack {
-    my ($self, $f, $src) = @_;
+    my ($self, $f, $src, $framed) = @_;
     my $prev = $self->{observed};
     my $obs = $f->{19} ? $f->{19}[1] : undef;
     if (defined $obs) {
@@ -427,7 +552,15 @@ sub _on_register_ack {
     }
     $self->{handle} = $f->{15} ? $f->{15}[1] : 0;
     $self->{ready} = 1;
-    $self->emit({ kind => 'registered', observed => $self->{observed}, handle => $self->{handle} });
+    $self->{last_ack_at} = time;
+    my $transport = $framed ? 'tcp' : 'udp';
+    # UDP answered: it is the committed path again, whatever the fallback was
+    # doing.  Closing here is what keeps the fallback a fallback.
+    $self->_tcp_close if $transport eq 'udp' && $self->{tcp};
+    $self->{transport} = $transport;
+    $self->cancel('tcp-fallback') if $transport eq 'tcp';
+    $self->emit({ kind => 'registered', observed => $self->{observed}, handle => $self->{handle},
+                  transport => $transport });
     $self->_schedule_refresh;
 
     # Our public address moved (a rebinding).  Tell every call that is running
