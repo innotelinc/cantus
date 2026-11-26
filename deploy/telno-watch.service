@@ -1,0 +1,13 @@
+[Unit]
+Description=Telephony watch — cantus relay and node, 7443/tcp, Telno healthz, trunk registration
+Documentation=file:///opt/cantus-src/deploy/telno-watch.sh
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/telno-watch.sh
+# The verdict is the notification, not the unit's exit status: a failing probe
+# that also failed the unit would double-alert through OnFailure and bury the
+# message that says which probe failed.
+Nice=10
