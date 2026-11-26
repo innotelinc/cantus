@@ -1,0 +1,40 @@
+# Cantus as two services: a relay that a symmetric NAT can reach, and a node that
+# holds a call. They come from one image because they are one binary with two
+# configs, and running them together keeps the pair in step.
+#
+#   CANTUS_SECRET=... docker compose up -d
+#
+# The relay publishes 7443/udp because that is the socket endpoints dial. The node
+# does not: it registers with the relay and is reached through it.
+services:
+  cantus-relay:
+    image: ${CANTUS_IMAGE:-ghcr.io/innotelinc/cantus:main}
+    container_name: cantus-relay
+    command: ["relay", "--config", "deploy/relay.json"]
+    environment:
+      CANTUS_SECRET: ${CANTUS_SECRET:?set CANTUS_SECRET in .env}
+    ports:
+      - "7443:7443/udp"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "perl", "-Ilib", "bin/cantus", "health", "--config", "deploy/relay.json", "--json"]
+      interval: 60s
+      timeout: 40s
+      retries: 2
+      start_period: 20s
+
+  cantus-node:
+    image: ${CANTUS_IMAGE:-ghcr.io/innotelinc/cantus:main}
+    container_name: cantus-node
+    command: ["node", "--config", "deploy/node.json"]
+    environment:
+      CANTUS_SECRET: ${CANTUS_SECRET:?set CANTUS_SECRET in .env}
+    depends_on:
+      - cantus-relay
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "perl", "-Ilib", "bin/cantus", "health", "--config", "deploy/node.json", "--json"]
+      interval: 60s
+      timeout: 40s
+      retries: 2
+      start_period: 20s

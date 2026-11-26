@@ -277,3 +277,17 @@ Cerulean Vault owns secrets, Cerulean owns trust, ONYX owns storage, Magnate own
 revenue, NPM Edge owns the edge, and every other platform is a business function
 that consumes them. See [docs/stack.md](docs/stack.md) for this platform's
 owns/consumes boundaries.
+
+## Run it as a service
+
+Two services from one image: a relay a symmetric NAT can reach, and a node that
+holds a call.
+
+    CANTUS_SECRET=... docker compose up -d
+
+The relay publishes `7443/udp`; the node registers with it and is reached through
+it. Each container's health check is `cantus health --config … --json`, which
+places a real call behind a symmetric NAT, flushes the mapping mid-call, and exits
+non-zero unless the relay carried the call and the audio survived. With
+`--config` it also fails when nothing is listening on the configured socket, so a
+dead daemon cannot report healthy.
