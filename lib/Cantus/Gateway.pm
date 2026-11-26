@@ -38,6 +38,7 @@ use JSON::PP ();
 use Socket qw(sockaddr_in inet_aton inet_ntoa);
 
 use Cantus::Node ();
+use Cantus::RouteSource ();
 use Cantus::Sip ();
 use Cantus::G711 ();
 use Cantus::Media ();
@@ -146,14 +147,30 @@ sub _load_trunk {
     die 'gateway: trunk secret missing (set ' . ($t->{secret_env} // 'TRUNK_SECRET') . ")\n"
         unless defined $secret && length $secret;
 
-    my $router;
-    if ($t->{routes}) {
-        open my $fh, '<', $t->{routes}
-            or die "gateway: cannot read routes '$t->{routes}': $!\n";
-        my $doc = do { local $/; <$fh> };
-        close $fh;
-        $router = Cantus::Router->new(doc => $doc, name => $t->{routes});
+    # Where the rules come from. A file on this host is a configuration and is
+    # read once; a control-plane URL is the normal case and is polled, because
+    # the point of reading it is that an edit there reaches the next call.
+    # A file that cannot be read stops the gateway (nothing can route); a URL
+    # that cannot be reached does not, because an outage of the control plane
+    # must not take the telephone system down with it.
+    my $source;
+    if (my $routes = $t->{routes}) {
+        my $is_url = $routes =~ m{^https?://};
+        my $token;
+        if ($is_url) {
+            my $env = $t->{routes_token_env} // 'ROUTING_TOKEN';
+            $token = $ENV{$env} // $t->{routes_token};
+        }
+        $source = Cantus::RouteSource->new(
+            ($is_url ? (url => $routes) : (file => $routes)),
+            token   => $token,
+            refresh => $t->{routes_refresh} // 30,
+            cache   => $t->{routes_cache},
+        );
+        die "gateway: cannot read routes '$routes': " . $source->last_error . "\n"
+            unless $is_url || defined $source->text;
     }
+    my $router = $source ? $source->router : undef;
 
     # Resolved once: the source of an inbound carrier call is checked against
     # these addresses, so a DID cannot be dialled by anything else on the LAN.
@@ -176,6 +193,9 @@ sub _load_trunk {
         from       => $t->{from} // $t->{user},
         dids       => $t->{dids} || {},
         router     => $router,
+        route_source => $source,
+        route_digest => ($source ? $source->digest : undef),
+        route_error  => ($source ? $source->last_error : ''),
         addr       => $t->{addr} // ($t->{host} . ':' . ($t->{port} // 5060)),
         ips        => \@ips,
         registered => 0,
@@ -362,9 +382,34 @@ sub pump {
         # than the refresh interval, or an inbound call arrives at nobody.
         $self->{next_trunk} = time + ($self->{trunk}{registered} ? TRUNK_REFRESH : 30);
     }
+    $self->_refresh_routes;
     $self->_rtp_tick;
     $self->_timers;
     return 1;
+}
+
+# The control plane's routing document, polled on its own clock. A reload is
+# logged with the rule count and the digest, so "the rules changed" is something
+# an operator can see in the journal rather than infer from a call going
+# somewhere new.
+sub _refresh_routes {
+    my ($self) = @_;
+    my $t = $self->{trunk} or return;
+    my $src = $t->{route_source} or return;
+
+    my $before = $t->{route_digest} // '';
+    my $router = $src->router;
+    if ($router && ($src->digest // '') ne $before) {
+        $t->{router} = $router;
+        $t->{route_digest} = $src->digest;
+        $self->emit({ kind => 'routes-loaded', source => $src->describe,
+                      routes => $router->route_count, digest => $src->digest });
+    }
+    my $err = $src->last_error // '';
+    if (length $err && $err ne ($t->{route_error} // '')) {
+        $t->{route_error} = $err;
+        $self->emit({ kind => 'routes-unavailable', source => $src->describe, error => $err });
+    }
 }
 
 sub _register_all {

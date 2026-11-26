@@ -54,6 +54,14 @@ sub load {
     return $self;
 }
 
+# How many rules a document carries: the one number an operator watching a
+# reload can compare, and the one that says a control plane sent an empty
+# document by mistake.
+sub route_count {
+    my ($self) = @_;
+    return scalar @{ $self->{doc}{routes} // [] };
+}
+
 sub _glob_match {
     my ($pattern, $value) = @_;
     return 1 unless defined $pattern;
