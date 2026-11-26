@@ -22,6 +22,7 @@ use warnings;
 use IO::Socket::INET;
 use IO::Select;
 use Digest::MD5 qw(md5_hex);
+use JSON::PP ();
 use Time::HiRes qw(time);
 use File::Path qw(make_path);
 use Cantus::Router;
@@ -175,11 +176,29 @@ sub _http_get {
     return $body;
 }
 
+# A stable digest of what the document says, without the parts that change on
+# every read: the same rules read twice are the same rules.
+sub _rules_digest {
+    my ($text) = @_;
+    return md5_hex('') if !defined $text || !length $text;
+    my $doc = eval { JSON::PP->new->decode($text) };
+    if (!$doc || ref $doc ne 'HASH') {
+        return md5_hex($text);
+    }
+    my %rules = map { exists $doc->{$_} ? ($_ => $doc->{$_}) : () } qw(version default routes);
+    return md5_hex(JSON::PP->new->canonical->encode(\%rules));
+}
+
 # Take a document only if it is one. A control plane that returns an error page
 # and a `200` must not turn into a set of rules that reject every call.
 sub _accept {
     my ($self, $text) = @_;
-    my $digest = md5_hex($text // '');
+    # The digest is over the rules, not over the reading. A document that says
+    # "generated at 10:00:01" is not a different set of rules from the same
+    # document at 10:00:31, and a digest over the timestamp makes every poll
+    # look like a change: the rules were being reloaded every 30 seconds while
+    # nothing in them had moved.
+    my $digest = _rules_digest($text);
     return 0 if defined $self->{digest} && $digest eq $self->{digest};
 
     my $router = eval { Cantus::Router->new(doc => $text, name => $self->{desc}) };

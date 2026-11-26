@@ -100,6 +100,20 @@ is($src->route_count, 3, 'and sees the three rules it was sent');
 is($src->last_error, '', 'with nothing to report');
 like($src->digest // '', qr/^[0-9a-f]{32}$/, 'the rules carry a digest, so a reload can be told from a poll');
 
+# A reading is not an edit. The control plane stamps every document with the
+# time it was made, and a digest over the whole body therefore changes on every
+# poll: in production that reloaded the rules every 30 seconds without a single
+# rule having moved.
+{
+    my $clock = Cantus::RouteSource->new(url => $url, token => $TOKEN);
+    is($clock->_accept('{"version":1,"generated_at":"2026-01-01T00:00:00Z","default":{"reject":3},"routes":[]}'),
+        1, 'a document loads');
+    my $first = $clock->digest;
+    is($clock->_accept('{"version":1,"generated_at":"2026-01-01T00:00:30Z","default":{"reject":3},"routes":[]}'),
+        0, 'the same rules, read again, are not a reload');
+    is($clock->digest, $first, 'and the digest did not move with the clock');
+}
+
 my $dec = $router->decide({ to => '4443', from => '101' });
 ok($dec->{matched}, '4443 is allowed to leave, because the document says so');
 is($dec->{route}, 'outbound-4443', 'and the rule that allowed it is named in the decision');
