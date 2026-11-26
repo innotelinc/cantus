@@ -65,6 +65,10 @@ sub new {
         ready       => 0,
         running     => 1,
         tone_hz     => $a{tone_hz} // 440,
+        # A bridge supplies the audio to send and consumes the audio it receives;
+        # without these a node is a test endpoint that talks to itself in a tone.
+        audio_source => $a{audio_source},
+        on_audio     => $a{on_audio},
         received_frames => 0,
         receive_peak => 0,
         relay_frames => 0,
@@ -858,10 +862,16 @@ sub _send_media {
     my ($self, $s) = @_;
     my $ptime = $s->{codec} ? $s->{codec}{ptime} : 20;
     my $n = Cantus::Media::frame_samples($ptime, $s->{codec} ? $s->{codec}{rate} : 8000);
-    my ($payload, $phase) = Cantus::Media::pcm_frame(
-        hz => $self->{tone_hz}, samples => $n, phase => $s->{phase} // 0,
-    );
-    $s->{phase} = $phase;
+    # A source returns the frame it wants sent; falling through to the tone is
+    # what keeps every existing demo and conformance case unchanged.
+    my $payload = $self->{audio_source} ? $self->{audio_source}->($s, $n) : undef;
+    unless (defined $payload) {
+        my ($tone, $phase) = Cantus::Media::pcm_frame(
+            hz => $self->{tone_hz}, samples => $n, phase => $s->{phase} // 0,
+        );
+        $s->{phase} = $phase;
+        $payload = $tone;
+    }
     my $m = Cantus::Wire::media_encode(
         stream => 0, tag => $s->{tag}, seq => $s->{seq}++, ts => ($s->{ts} // 0),
         codec => 2, flags => 0, payload => $payload,
@@ -905,6 +915,8 @@ sub on_media {
     }
     my $peak = Cantus::Media::peak($m->{payload});
     $s->{peak} = $peak if $peak > ($s->{peak} // 0);
+    $self->{on_audio}->($s, $m->{payload}, $m->{codec})
+        if $self->{on_audio} && defined $m->{payload} && length $m->{payload};
     $self->{received_frames}++;
     $self->{receive_peak} = $peak if $peak > $self->{receive_peak};
     # Classified by where the packet came from, not by which path we happen to

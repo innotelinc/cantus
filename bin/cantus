@@ -15,6 +15,8 @@ use Cantus::Session ();
 use Cantus::Scenario ();
 use Cantus::Daemon ();
 use Cantus::Health ();
+use Cantus::Gateway ();
+use Cantus::Phone ();
 use JSON::PP ();
 use IO::Socket::INET ();
 
@@ -35,6 +37,17 @@ cantus $VERSION — a realtime voice standard built around one socket
       and report the path that was chosen and the audio that arrived.
       --rebind flushes the NAT tables mid-call and shows the failover to the
       relay and the return to a direct path.
+
+  cantus gateway --config gateway.json [--quiet]
+      The SIP edge: one account, one extension, G.711 at the border and
+      pcm-s16 inside. A registered softphone calls it; the call is placed
+      through a Cantus node, so reach, relay fallback and rebinding are the
+      same code a production node runs.
+
+  cantus phone --server HOST:PORT --password PW [--seconds 6] [--json]
+      A SIP test phone: register with digest auth, invite, send a tone at
+      the asked-for amplitude, and report what came back -- frames, peak and
+      whether the far end's 440 Hz tone was actually heard.
 
   cantus health [--config node.json] [--nat symmetric] [--json]
       What a container runs as its health check: place a real call behind a
@@ -162,6 +175,43 @@ if ($cmd eq 'demo') {
     }
     print "\nPASS\n";
     exit 0;
+}
+
+if ($cmd eq 'gateway') {
+    my ($config, $quiet) = (undef, 0);
+    GetOptions('config=s' => \$config, 'quiet' => \$quiet)
+        or die "cantus: bad options for gateway (try: cantus help)\n";
+    die "cantus: gateway needs --config <file>\n" unless defined $config;
+    my $gateway = Cantus::Gateway->new(
+        config => Cantus::Daemon::load_config($config),
+        quiet  => $quiet,
+    );
+    exit $gateway->run;
+}
+
+if ($cmd eq 'phone') {
+    my ($server, $user, $password, $target, $seconds, $json) =
+        ('127.0.0.1:5062', '101', undef, undef, 6, 0);
+    GetOptions('server=s' => \$server, 'user=s' => \$user, 'password=s' => \$password,
+               'target=s' => \$target, 'seconds=f' => \$seconds, 'json' => \$json)
+        or die "cantus: bad options for phone (try: cantus help)\n";
+    $password //= $ENV{GATEWAY_PASSWORD};
+    die "cantus: phone needs --password or GATEWAY_PASSWORD\n" unless defined $password;
+
+    my $phone = Cantus::Phone->new(
+        server => $server, user => $user, password => $password,
+        target => $target // $user, seconds => $seconds, quiet => $json,
+    );
+    my ($ok, $why) = $phone->register;
+    my $report = $ok ? $phone->call : { ok => 0, error => $why };
+    if ($json) {
+        print JSON::PP->new->canonical->encode($report), "\n";
+    }
+    else {
+        print join(' ', map { "$_=" . (defined $report->{$_} ? $report->{$_} : '-') }
+                        sort keys %$report), "\n";
+    }
+    exit($report->{ok} ? 0 : 1);
 }
 
 if ($cmd eq 'health') {

@@ -1,0 +1,12 @@
+{
+  "bind": "0.0.0.0:5062",
+  "advertise": "192.168.1.53",
+  "realm": "cantus",
+  "account": {
+    "user": "101"
+  },
+  "id": "gateway@switch.example",
+  "relay": "127.0.0.1:7443",
+  "target": "node@switch.example",
+  "debug": 0
+}

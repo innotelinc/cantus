@@ -28,7 +28,13 @@ sub pcm_frame {
     for my $i (0 .. $n - 1) {
         push @s, int($amp * sin($phase + $i * $step));
     }
-    return (pack('s<*', @s), ($phase + $n * $step) % (2 * 3.14159265358979));
+    # Perl's % is an integer modulus, so wrapping the phase with it snapped
+    # every frame to a whole radian -- a phase jump, and an audible click, every
+    # 20 ms. Wrap in floating point instead.
+    my $tau  = 2 * 3.14159265358979;
+    my $next = $phase + $n * $step;
+    $next -= $tau * int($next / $tau);
+    return (pack('s<*', @s), $next);
 }
 
 # Peak amplitude of a pcm-s16 payload, used by tests to prove audio arrived.
