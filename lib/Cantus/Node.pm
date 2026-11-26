@@ -213,7 +213,13 @@ sub sendto {
     if ($self->{via}) { $self->{via}->($dest, $bytes); return 1 }
     my ($ip, $port) = split /:/, $dest, 2;
     return 0 unless defined $port;
-    $self->{sock}->send($bytes, 0, scalar sockaddr_in($port, inet_aton($ip)));
+    # A relay that is down takes its DNS name with it. That is a dropped send and
+    # a retry on the next REGISTER, not an exception: dying here turned a relay
+    # restart into a node outage, and the whole point of the fallback is that the
+    # endpoint keeps trying.
+    my $packed = inet_aton($ip);
+    return 0 unless defined $packed;
+    $self->{sock}->send($bytes, 0, scalar sockaddr_in($port, $packed));
     return 1;
 }
 

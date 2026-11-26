@@ -162,7 +162,9 @@ sub sendto {
     return unless $self->{sock};
     my ($ip, $port) = split /:/, $dest, 2;
     return unless defined $port;
-    $self->{sock}->send($bytes, 0, scalar sockaddr_in($port, inet_aton($ip)));
+    my $packed = inet_aton($ip);
+    return unless defined $packed;    # a registration that no longer resolves is a drop, not a crash
+    $self->{sock}->send($bytes, 0, scalar sockaddr_in($port, $packed));
 }
 
 # A registration that came over TCP is a live connection, not an address: write

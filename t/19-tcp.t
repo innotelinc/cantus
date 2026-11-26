@@ -162,4 +162,19 @@ ok($dual_node->handle, 'the UDP REGISTER is answered');
 is($dual_node->stats->{transport}, 'udp', 'the node is back on UDP');
 ok(!$dual_node->{tcp}, 'and the TCP connection was closed');
 
+# ------------------------------ a relay whose name is gone is a dropped send
+
+# Stopping the relay container also removes its Docker DNS name, so the node's
+# next REGISTER resolves to nothing at all. That has to be a send that does not
+# happen and is retried, not an exception that ends the daemon: measured on .53,
+# a relay restart killed the node with `Undefined address for
+# Socket::pack_sockaddr_in`, which turned a recoverable relay blip into an outage.
+my $orphan = Cantus::Node->new(
+    id => 'orphan@test', secret => 'test-key', bind => '127.0.0.1:0',
+    relay => 'cantus-relay-not-here.invalid:7443', require_sig => 0, auto_answer => 0,
+);
+is($orphan->sendto('cantus-relay-not-here.invalid:7443', 'x'), 0,
+    'an unresolvable relay is a dropped send, not a crash');
+ok($orphan->register, 'and the node keeps trying instead of dying');
+
 done_testing();
