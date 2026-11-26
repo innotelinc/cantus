@@ -323,11 +323,17 @@ print $rfh JSON::PP->new->canonical->encode({
     routes  => [
         { name => 'carrier-echo', when => { to => '4443' },
           then => [ { forward => { to => 'pstn:4443' } } ] },
-        # The ten-digit form of the DID. A carrier picks one form or the other,
-        # and `trunk.dids` below deliberately keeps only the eleven-digit key so
-        # the inbound path has to ask the document.
+        # Both digit forms of the same DID, because a carrier picks one of them
+        # and the document, not the gateway, says where each one goes.
+        { name => 'did-14132642700', when => { to => '14132642700' },
+          then => [ { answer => {} }, { forward => { to => 'ext:101' } } ] },
         { name => 'did-4132642700', when => { to => '4132642700' },
           then => [ { answer => {} }, { forward => { to => 'ext:101' } } ] },
+        # Numbers we own but do not answer: the document refuses them.
+        { name => 'did-14135550111-fax', when => { to => '14135550111' },
+          then => [ { reject => 3 } ] },
+        { name => 'did-14135550112-unrouted', when => { to => '14135550112' },
+          then => [ { reject => 3 } ] },
         { name => 'pstn-national', when => { to => '1*' },
           then => [ { forward => { to => 'pstn:' } } ] },
     ],
@@ -347,7 +353,6 @@ my $gateway = Cantus::Gateway->new(
             host => '127.0.0.1', port => $carrier->port,
             user => '235662_test', secret_env => 'TRUNK_SECRET',
             realm => 'carrier', from => $DID,
-            dids => { $DID => 'node@trunk.test' },
             routes => $routes_path,
         },
     },
@@ -456,51 +461,67 @@ is($reg->{user}, '235662_test', 'the registration names the sub-account');
 
 # ---------------------------------------------------------------- inbound DID
 
-my $before = $carrier->{rx_frames};
-$carrier->invite_in(did => $DID, gw => "127.0.0.1:$sip_port");
-spin(2.5);
-is($carrier->{in}{code}, 200, 'a call to the DID is answered inside the offered codec');
-my $placed = wait_for_event('trunk-invite', 2);
-ok($placed, 'and the DID is mapped to a Cantus address of record');
-is($placed->{to}, 'node@trunk.test', 'the DID is placed to the configured node, not "wherever"');
-is($placed->{did}, $DID, 'the CDR-side DID is the one that was dialled');
+# The routing document is the only source for an inbound DID. A carrier picks a
+# digit form and the document names both; a rule that refuses is a decision the
+# carrier is told about, not a lookup that failed.
 
-spin(2.0);
-cmp_ok($carrier->{rx_frames} - $before, '>', 10, 'the DID caller hears the Cantus node');
-cmp_ok($carrier->{rx_peak}, '>', 0, 'and what it hears is not silence');
+sub did_event {
+    my ($kind, $did, $seconds) = @_;
+    my $deadline = time + ($seconds // 3);
+    while (time < $deadline) {
+        spin(0.2);
+        my ($ev) = grep { ($_->{did} // '') eq $did } events_of($kind);
+        return $ev if $ev;
+    }
+    return undef;
+}
 
-$carrier->bye_in("127.0.0.1:$sip_port");
-spin(1.0);
-my ($inbound) = grep { ($_->{direction} // '') eq 'inbound' && ($_->{line} // '') eq 'trunk' } cdr_events();
-ok($inbound, 'the inbound carrier call left a CDR');
-is($inbound->{from}, $DID, 'naming the DID as the caller');
-is($inbound->{to}, 'node@trunk.test', 'and the node as the destination');
-ok($inbound->{answered}, 'marked answered');
-cmp_ok($inbound->{rx_frames}, '>', 10, 'with the caller audio counted toward Cantus');
+my $eleven = do {
+    $carrier->invite_in(did => '14132642700', gw => "127.0.0.1:$sip_port");
+    my $ev = did_event('trunk-invite', '14132642700');
+    $carrier->bye_in("127.0.0.1:$sip_port");
+    spin(0.6);
+    $ev;
+};
+ok($eleven, 'the eleven-digit DID is placed from the document');
+is($eleven->{route}, 'did-14132642700', 'quoting the eleven-digit route');
+is($eleven->{to}, 'gw-101@trunk.test', 'to line 101, which the rule names');
 
-my $invites_before = scalar @{ $carrier->{invites} };
+my $ten = do {
+    $carrier->invite_in(did => '4132642700', gw => "127.0.0.1:$sip_port");
+    my $ev = did_event('trunk-invite', '4132642700');
+    $carrier->bye_in("127.0.0.1:$sip_port");
+    spin(0.6);
+    $ev;
+};
+ok($ten, 'and the ten-digit form of the same DID lands on it');
+is($ten->{route}, 'did-4132642700', 'through its own route');
+is($ten->{to}, 'gw-101@trunk.test', 'to line 101');
+
+# A fax number: the document says reject, so the carrier is refused — not 404.
+$carrier->invite_in(did => '14135550111', gw => "127.0.0.1:$sip_port");
+spin(1.2);
+is($carrier->{in}{code}, 403, 'a fax number is refused by its rule');
+my $fax = did_event('trunk-rejected-did', '14135550111', 1);
+ok($fax, 'and the refusal is logged with the number');
+is($fax->{route}, 'did-14135550111-fax', 'quoting the fax route');
+is($fax->{code}, 403, 'with the status the carrier was sent');
+
+# A DID we own with no line to answer it: the document refuses that too.
+$carrier->invite_in(did => '14135550112', gw => "127.0.0.1:$sip_port");
+spin(1.2);
+is($carrier->{in}{code}, 403, 'a DID with no line is refused by its rule');
+my $unrouted = did_event('trunk-rejected-did', '14135550112', 1);
+is($unrouted->{route}, 'did-14135550112-unrouted', 'quoting the unrouted route');
+
+# A number the document does not know falls to its default, which is a refusal:
+# the gateway never invents a destination.
 $carrier->invite_in(did => '9999999999', gw => "127.0.0.1:$sip_port");
 spin(1.2);
-is($carrier->{in}{code}, 404, 'a DID that is not configured is 404, not routed somewhere');
-
-# ------------------------------------------------- DID from the document
-
-# The same number in the form the carrier actually sends. `dids` has no entry
-# for it; the routing document does, and its target is a line, not a node.
-$carrier->invite_in(did => '4132642700', gw => "127.0.0.1:$sip_port");
-# The log already holds the earlier DID's trunk-invite, so pick by the number
-# rather than taking the first event of that kind.
-my $ten;
-my $ten_deadline = time + 3;
-while (time < $ten_deadline && !$ten) {
-    spin(0.2);
-    ($ten) = grep { ($_->{did} // '') eq '4132642700' } events_of('trunk-invite');
-}
-ok($ten, 'the ten-digit DID is accepted when the document names it');
-is($ten->{to}, 'gw-101@trunk.test', 'and forwarded to the line the document names');
-is($ten->{route}, 'did-4132642700', 'quoting the route that matched');
-$carrier->bye_in("127.0.0.1:$sip_port");
-spin(0.6);
+is($carrier->{in}{code}, 403, 'an unknown number takes the document default');
+my $unknown = did_event('trunk-rejected-did', '9999999999', 1);
+ok($unknown, 'and is logged as rejected, not as a routing failure');
+ok(!defined $unknown->{route}, 'with no route name, because none matched');
 
 # ---------------------------------------------------------------- outbound
 
@@ -532,7 +553,7 @@ ok($outbound->{answered}, 'as answered');
 cmp_ok($outbound->{rx_frames}, '>', 5, 'with audio in both directions');
 
 # A number no route allows never reaches the carrier.
-$invites_before = scalar @{ $carrier->{invites} };
+my $invites_before = scalar @{ $carrier->{invites} };
 my $bad = Cantus::Phone->new(
     server => "127.0.0.1:$sip_port", user => '101', password => 'test123',
     local_port => free_port(), rtp_port => free_port(), quiet => 1,

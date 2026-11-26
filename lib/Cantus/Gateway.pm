@@ -191,7 +191,6 @@ sub _load_trunk {
         secret     => $secret,
         realm      => $t->{realm} // $t->{host},
         from       => $t->{from} // $t->{user},
-        dids       => $t->{dids} || {},
         router     => $router,
         route_source => $source,
         route_digest => ($source ? $source->digest : undef),
@@ -325,7 +324,7 @@ sub stats {
         trunk      => $self->{trunk}
             ? { user => $self->{trunk}{user}, host => $self->{trunk}{host},
                 registered => $self->{trunk}{registered} ? 1 : 0,
-                dids => [ sort keys %{ $self->{trunk}{dids} } ] }
+                routes => $self->{trunk}{router} ? $self->{trunk}{router}->route_count : 0 }
             : undef,
     };
 }
@@ -342,7 +341,7 @@ sub run {
                   lines => [ map { $_->{user} } @{ $self->{order} } ],
                   ($self->{trunk}
                     ? (trunk => { user => $self->{trunk}{user}, host => $self->{trunk}{host},
-                                  dids => [ sort keys %{ $self->{trunk}{dids} } ] })
+                                  routes => $self->{trunk}{router} ? $self->{trunk}{router}->route_count : 0 })
                     : ()) });
     $self->_register_all;
     while ($self->{running}) {
@@ -886,6 +885,15 @@ sub _notify_refer {
 # The carrier's own address, resolved at startup.  A DID is public knowledge;
 # the source address is what says the call came from the carrier and not from
 # a laptop on the LAN dialling the number it can read off a bill.
+# `reject: 3` in a document is the Cantus cause, not a SIP status line. Inbound
+# refuses with a status the carrier will not retry, and a rule that names a
+# 4xx/5xx status is taken literally.
+sub _did_reject_code {
+    my ($self, $v) = @_;
+    return $v if defined $v && $v =~ /^\d{3}$/ && $v >= 400 && $v <= 699;
+    return 403;
+}
+
 sub _trunk_source {
     my ($self, $msg) = @_;
     my ($ip) = split /:/, $msg->{src} // '', 2;
@@ -893,9 +901,10 @@ sub _trunk_source {
     return scalar grep { $_ eq $ip } @{ $self->{trunk}{ips} || [] };
 }
 
-# A DID arrives: look up its address of record, place the Cantus leg, and only
-# then answer the carrier.  `dids` is the whole inbound routing document -- a
-# DID that is not in it is 404, not "whatever is configured".
+# A DID arrives: the routing document says whether to answer it and where, and
+# only after that leg is placed is the carrier answered. A rule that refuses is
+# honoured as a refusal — an unknown DID and a fax DID are both decisions the
+# document made, so neither is a lookup failure.
 sub _trunk_invite {
     my ($self, $msg) = @_;
     my $t = $self->{trunk};
@@ -904,24 +913,27 @@ sub _trunk_invite {
     my $to  = Cantus::Sip::parse_uri($msg->{uri});
     my $did = $to && defined $to->{user} ? $to->{user} : '';
     $did =~ s/^\+//;
-    my $aor = $t->{dids}{$did} // $t->{dids}{ '+' . $did };
-    my $route;
-    # A carrier may send a North American number in either form, and the routing
-    # document carries both. `dids` is the older map and can name only one of
-    # them; asking the document keeps the inbound path and the rules the operator
-    # can see from disagreeing about the same number.
-    if (!$aor && $t->{router}) {
-        my $dec = $t->{router}->decide({ to => $did, verified => 1 });
-        my ($fwd) = grep { ref $_ eq 'HASH' && $_->{forward} } @{ $dec->{actions} || [] };
-        my $dest = $fwd && ref $fwd->{forward} eq 'HASH' ? $fwd->{forward}{to} : undef;
-        if (defined $dest && $dest =~ /^ext:(.+)$/ && $self->{lines}{$1}) {
-            $aor   = $self->{lines}{$1}{id};
-            $route = $dec->{route};
-        }
+    # The routing document is the only answer to "where does this DID go". A
+    # carrier picks a digit form and the operator's document names both; a rule
+    # that refuses — a fax number, a DID with no line — is a decision too, so the
+    # carrier is told what the rule says instead of being told 404.
+    my $dec = $t->{router}
+        ? $t->{router}->decide({ to => $did, verified => 1 })
+        : { matched => 0, route => undef, actions => [ { reject => 3 } ] };
+
+    my ($fwd) = grep { ref $_ eq 'HASH' && $_->{forward} } @{ $dec->{actions} || [] };
+    my $dest = $fwd && ref $fwd->{forward} eq 'HASH' ? $fwd->{forward}{to} : undef;
+    my ($aor, $route);
+    if (defined $dest && $dest =~ /^ext:(.+)$/ && $self->{lines}{$1}) {
+        $aor   = $self->{lines}{$1}{id};
+        $route = $dec->{route};
     }
     unless ($aor) {
-        $self->emit({ kind => 'trunk-unknown-did', call => $call_id, did => $did, src => $msg->{src} });
-        $self->_reply($msg, 404);
+        my ($reject) = grep { ref $_ eq 'HASH' && exists $_->{reject} } @{ $dec->{actions} || [] };
+        my $code = $self->_did_reject_code($reject ? $reject->{reject} : 3);
+        $self->emit({ kind => 'trunk-rejected-did', call => $call_id, did => $did,
+                      route => $dec->{route}, code => $code, src => $msg->{src} });
+        $self->_reply($msg, $code);
         return;
     }
 

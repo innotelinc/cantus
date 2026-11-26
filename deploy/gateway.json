@@ -16,7 +16,6 @@
     "secret_env": "TRUNK_SECRET",
     "realm": "newyork1.voip.ms",
     "from": "14132642700",
-    "dids": { "14132642700": "node@switch.example" },
     "routes": "http://127.0.0.1:8080/api/routing/document",
     "routes_token_env": "ROUTING_TOKEN",
     "routes_refresh": 30,
