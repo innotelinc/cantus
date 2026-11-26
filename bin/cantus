@@ -14,6 +14,11 @@ use Cantus::Router ();
 use Cantus::Session ();
 use Cantus::Scenario ();
 use Cantus::Daemon ();
+use Cantus::Health ();
+use Cantus::Gateway ();
+use Cantus::Phone ();
+use JSON::PP ();
+use IO::Socket::INET ();
 
 my $VERSION = '1.0.0';
 
@@ -27,11 +32,28 @@ if ($cmd eq 'help' || $cmd eq '--help' || $cmd eq '-h') {
     print <<"USAGE";
 cantus $VERSION — a realtime voice standard built around one socket
 
-  cantus demo [--nat none|cone|symmetric] [--rebind] [--quiet] [--media SECONDS]
+  cantus demo [--nat none|cone|symmetric] [--rebind] [--quiet] [--media SECONDS] [--json]
       Run a relay and two endpoints, place a real call over real sockets,
       and report the path that was chosen and the audio that arrived.
       --rebind flushes the NAT tables mid-call and shows the failover to the
       relay and the return to a direct path.
+
+  cantus gateway --config gateway.json [--quiet]
+      The SIP edge: one account, one extension, G.711 at the border and
+      pcm-s16 inside. A registered softphone calls it; the call is placed
+      through a Cantus node, so reach, relay fallback and rebinding are the
+      same code a production node runs.
+
+  cantus phone --server HOST:PORT --password PW [--seconds 6] [--json]
+      A SIP test phone: register with digest auth, invite, send a tone at
+      the asked-for amplitude, and report what came back -- frames, peak and
+      whether the far end's 440 Hz tone was actually heard.
+
+  cantus health [--config node.json] [--nat symmetric] [--json]
+      What a container runs as its health check: place a real call behind a
+      symmetric NAT, flush the mapping mid-call, and fail unless the relay
+      carried it and the call survived. With --config it also proves the
+      daemon still holds its socket, which a scenario run alone cannot.
 
   cantus route-test <document.json> [--to AOR] [--from AOR] [--hour HH:MM]
       Evaluate a routing document offline.  Nothing is executed.
@@ -72,9 +94,9 @@ if ($cmd eq 'node' || $cmd eq 'relay') {
 }
 
 if ($cmd eq 'demo') {
-    my ($nat, $quiet, $media, $verbose, $rebind) = ('none', 0, 1.2, 0, 0);
+    my ($nat, $quiet, $media, $verbose, $rebind, $json) = ('none', 0, 1.2, 0, 0, 0);
     GetOptions('nat=s' => \$nat, 'quiet' => \$quiet, 'media=f' => \$media,
-               'verbose' => \$verbose, 'rebind' => \$rebind);
+               'verbose' => \$verbose, 'rebind' => \$rebind, 'json' => \$json);
     die "cantus: --rebind needs a middlebox (--nat cone or symmetric)\n"
         if $rebind && $nat eq 'none';
     die "cantus: --nat must be none, cone or symmetric\n"
@@ -94,6 +116,28 @@ if ($cmd eq 'demo') {
         media_seconds => $rebind ? ($media > 9 ? $media : 9) : $media,
         ($rebind ? (rebind_at => 0.5) : ()),
     );
+
+    my $verdict = Cantus::Health::verdict($r, nat => $nat, rebind => $rebind);
+
+    if ($json) {
+        print JSON::PP->new->canonical->encode({
+            ok            => $verdict->{ok} ? JSON::PP::true : JSON::PP::false,
+            error         => $verdict->{error},
+            nat           => $nat,
+            rebind        => $rebind ? 1 : 0,
+            call          => $r->{call},
+            codec         => $r->{codec},
+            path          => $r->{path},
+            frames        => $r->{frames} // 0,
+            peak          => $r->{peak} // 0,
+            direct_frames => $r->{direct_frames} // 0,
+            relay_frames  => $r->{relay_frames} // 0,
+            ended         => $r->{ended} ? 1 : 0,
+            recovered_at  => $r->{recovered_at},
+            premature_end => $r->{premature_end} // 0,
+        }), "\n";
+        exit($verdict->{ok} ? 0 : 1);
+    }
 
     print "\n";
     if (!$r->{ok}) {
@@ -125,12 +169,95 @@ if ($cmd eq 'demo') {
         printf "  nat           %s: %d dropped unsolicited, %d forwarded\n",
             $_, $ns{$_}{dropped}, $ns{$_}{forwarded} for sort keys %ns;
     }
-    if ($rebind && !defined $r->{recovered_at}) {
-        print "\nFAILED: the call never returned to a direct path\n";
+    if (!$verdict->{ok}) {
+        printf "\nFAILED: %s\n", $verdict->{error};
         exit 1;
     }
     print "\nPASS\n";
     exit 0;
+}
+
+if ($cmd eq 'gateway') {
+    my ($config, $quiet) = (undef, 0);
+    GetOptions('config=s' => \$config, 'quiet' => \$quiet)
+        or die "cantus: bad options for gateway (try: cantus help)\n";
+    die "cantus: gateway needs --config <file>\n" unless defined $config;
+    my $gateway = Cantus::Gateway->new(
+        config => Cantus::Daemon::load_config($config),
+        quiet  => $quiet,
+    );
+    exit $gateway->run;
+}
+
+if ($cmd eq 'phone') {
+    my ($server, $user, $password, $target, $seconds, $json) =
+        ('127.0.0.1:5062', '101', undef, undef, 6, 0);
+    GetOptions('server=s' => \$server, 'user=s' => \$user, 'password=s' => \$password,
+               'target=s' => \$target, 'seconds=f' => \$seconds, 'json' => \$json)
+        or die "cantus: bad options for phone (try: cantus help)\n";
+    $password //= $ENV{GATEWAY_PASSWORD};
+    die "cantus: phone needs --password or GATEWAY_PASSWORD\n" unless defined $password;
+
+    my $phone = Cantus::Phone->new(
+        server => $server, user => $user, password => $password,
+        target => $target // $user, seconds => $seconds, quiet => $json,
+    );
+    my ($ok, $why) = $phone->register;
+    my $report = $ok ? $phone->call : { ok => 0, error => $why };
+    if ($json) {
+        print JSON::PP->new->canonical->encode($report), "\n";
+    }
+    else {
+        print join(' ', map { "$_=" . (defined $report->{$_} ? $report->{$_} : '-') }
+                        sort keys %$report), "\n";
+    }
+    exit($report->{ok} ? 0 : 1);
+}
+
+if ($cmd eq 'health') {
+    my ($config, $nat, $json) = (undef, 'symmetric', 0);
+    GetOptions('config=s' => \$config, 'nat=s' => \$nat, 'json' => \$json)
+        or die "cantus: bad options for health (try: cantus help)\n";
+    die "cantus: --nat must be none, cone or symmetric\n"
+        unless $nat =~ /^(none|cone|symmetric)$/;
+
+    my $report = sub {
+        my ($ok, $error, $r) = @_;
+        if ($json) {
+            print JSON::PP->new->canonical->encode({
+                ok            => $ok ? JSON::PP::true : JSON::PP::false,
+                error         => $error,
+                nat           => $nat,
+                path          => $r ? $r->{path} : undef,
+                frames        => $r ? ($r->{frames} // 0) : 0,
+                peak          => $r ? ($r->{peak} // 0) : 0,
+                relay_frames  => $r ? ($r->{relay_frames} // 0) : 0,
+                premature_end => $r ? ($r->{premature_end} // 0) : 0,
+            }), "\n";
+        } else {
+            printf "cantus health: %s%s\n", $ok ? 'ok' : 'unhealthy', $error ? " — $error" : '';
+        }
+        exit($ok ? 0 : 1);
+    };
+
+    # A scenario run in this process proves the library, not that the service is
+    # up. With a config in hand the socket has to be taken already: if this
+    # process can bind the configured port, nothing is listening on it.
+    if (defined $config) {
+        my $cfg = Cantus::Daemon::load_config($config);
+        my ($host, $port) = split /:/, ($cfg->{bind} // ''), 2;
+        $host = '0.0.0.0' unless defined $host && length $host;
+        if (my $sock = IO::Socket::INET->new(
+                LocalAddr => $host, LocalPort => $port, Proto => 'udp', ReuseAddr => 0)) {
+            close $sock;
+            $report->(0, "nothing is listening on $host:$port", undef);
+        }
+    }
+
+    my $scenario = Cantus::Scenario->new(nat => $nat);
+    my $r = $scenario->run(media_seconds => 9, rebind_at => 0.5);
+    my $v = Cantus::Health::verdict($r, nat => $nat, rebind => 1);
+    $report->($v->{ok}, $v->{error}, $r);
 }
 
 if ($cmd eq 'route-test') {
