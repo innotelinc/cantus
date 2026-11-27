@@ -998,8 +998,14 @@ sub _trunk_invite {
     # from the local line instead -- extension 101, our own realm -- the BYE is
     # one the carrier cannot place, and its caller stays connected.
     my ($remote_target) = (Cantus::Sip::header($msg, 'contact') // '') =~ /<\s*(sips?:[^>\s]+)\s*>/;
+    # The dialog's CSeq belongs to the carrier's edge: the INVITE it sent is the
+    # last sequence number it knows here. Our in-dialog requests continue from
+    # it, so the hangup arrives as 103 after their 102 rather than restarting
+    # at 1, which is a request their edge cannot place in this dialog.
+    my $cseq = (Cantus::Sip::header($msg, 'cseq') // '') =~ /^(\d+)/ ? $1 : 0;
     my $d = $self->_new_dialog($line,
         call_id   => $call_id,
+        cseq      => $cseq,
         from_tag  => Cantus::Sip::tag($msg, 'from') // 'carrier',
         codec     => $sdp->{codec}, event_pt => $sdp->{event_pt},
         phone_placed => 0, trunk_in => 1,
@@ -1266,21 +1272,17 @@ sub _route_set_from {
 }
 
 # Where one of this end's in-dialog requests goes and how it is addressed. With no
-# route set that is simply the remote target. With one, the request is sent to the
-# first hop and the set travels in Route -- or, when that hop asked for strict
-# routing, it becomes the request-URI and the remote target follows it.
+# route set that is simply the remote target. With one, the request keeps the
+# remote target as its request-URI and travels to the first hop, with the whole
+# set in Route: every hop this gateway records is a loose one, and a request that
+# guesses otherwise is one the hop it guesses at cannot forward.
 sub _in_dialog_target {
     my ($self, $d, $remote) = @_;
     my @route = @{ $d->{route_set} || [] };
     return ($remote, [], undef) unless @route;
-    my $first = $route[0];
-    my $hop = Cantus::Sip::parse_uri($first) or return ($remote, [], undef);
+    my $hop = Cantus::Sip::parse_uri($route[0]) or return ($remote, [], undef);
     my $addr = $hop->{host} . ':' . $hop->{port};
-    return ($remote, [ map { 'Route: ' . $_ } @route ], $addr) if $first =~ /;lr\b/;
-    (my $uri = $first) =~ s/^<\s*//;
-    $uri =~ s/\s*>$//;
-    shift @route;
-    return ($uri, [ map { 'Route: ' . $_ } ($remote, @route) ], $addr);
+    return ($remote, [ map { 'Route: ' . $_ } @route ], $addr);
 }
 
 sub _send_ack {

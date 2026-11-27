@@ -136,7 +136,10 @@ sub invite_in {
     my $contact = "<$contact_uri>";
     # A carrier edge in the path records itself, as voip.ms's does.
     my $route = "<sip:127.0.0.1:$self->{proxy_port};lr>";
-    $self->{in} = { call => $call, did => $a{did}, caller => $caller,
+    # voip.ms sends its INVITE at 102, and its edge counts the dialog's CSeq
+    # from there: a hangup that arrives as 1 is not the next request it expects.
+    my $cseq = $a{cseq} // 102;
+    $self->{in} = { call => $call, did => $a{did}, caller => $caller, cseq => $cseq,
                     from_tag => $from_tag, state => 'calling', code => 0,
                     from_hdr => "<sip:$caller\@carrier.example>;tag=$from_tag",
                     to_hdr   => "<sip:$a{did}\@$gw>",
@@ -148,7 +151,7 @@ sub invite_in {
         from    => $self->{in}{from_hdr},
         to      => $self->{in}{to_hdr},
         call_id => $call,
-        cseq    => 1,
+        cseq    => $cseq,
         contact => $contact,
         headers => [ "Record-Route: $route" ],
         body    => $self->_sdp,
@@ -267,20 +270,25 @@ sub _request {
         $self->{byes}++;
         # A UAS places an in-dialog request only inside the dialog it opened:
         # same Call-ID, the From it sent (URI and tag), a To carrying the tag
-        # from its own 200, and a request-URI naming the Contact it published.
-        # Anything else is 481 -- and a caller whose phone never drops is
-        # exactly what a 481 looks like from the far side of the call.
+        # from its own 200, a request-URI naming the Contact it published, and
+        # a CSeq that continues the one its INVITE carried. Anything else is
+        # 481 -- and a caller whose phone never drops is exactly what a 481
+        # looks like from the far side of the call.
         my $in = $self->{in};
         my $call = Cantus::Sip::header($msg, 'call-id') // '';
+        my $cseq = (Cantus::Sip::header($msg, 'cseq') // '') =~ /^(\d+)/ ? $1 : 0;
+        $self->{bye_cseq} = $cseq;
         my ($placed, $why) = (0, 'no call to place it in');
         if ($in && $call eq $in->{call}) {
             my $from = Cantus::Sip::header($msg, 'from') // '';
             my $to   = Cantus::Sip::header($msg, 'to') // '';
             my $uri  = $msg->{uri} // '';
             my $want_to = $in->{to_hdr} . ';tag=' . ($in->{to_tag} // 'gw');
+            my $want_cseq = ($in->{cseq} // 0) + 1;
             if    ($from ne $in->{from_hdr}) { $why = "From $from" }
             elsif ($to   ne $want_to)        { $why = "To $to (want $want_to)" }
             elsif ($uri  ne $in->{contact})  { $why = "request-URI $uri" }
+            elsif ($cseq != $want_cseq)      { $why = "CSeq $cseq (want $want_cseq)" }
             else  { ($placed, $why) = (1, 'matched') }
         }
         $self->{bye_placed} = $placed;
@@ -841,6 +849,8 @@ cmp_ok($carrier->{byes}, '>', $byes_before, 'the softphone hanging up sends the 
 ok($carrier->{bye_placed},
    'and the carrier can place that BYE in the dialog it opened')
     or diag("the BYE did not match the carrier's dialog: $carrier->{bye_why}");
+is($carrier->{bye_cseq}, ($carrier->{in}{cseq} // 0) + 1,
+   'and it continues the dialog CSeq the INVITE carried, rather than restarting at 1');
 
 # The carrier's edge recorded its route on the INVITE, so the hangup has to travel
 # through it: a BYE addressed straight at the UAS never reaches the proxy that
