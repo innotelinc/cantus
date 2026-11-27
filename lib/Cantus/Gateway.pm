@@ -1798,8 +1798,14 @@ sub _drain_rtp {
 sub _rtp_tick {
     my ($self, $now) = @_;
     $now //= time;
+    # One frame per 20 ms, on that clock.  The loop runs hundreds of times a
+    # second (TICK is 2 ms), and sending on every pass put nearly twice the
+    # audio on the wire while draining each inbound queue at that same rate --
+    # the far end heard half its frames replaced by padding. That is the chop.
+    return if $now < $self->{next_rtp};
+    # A stall is not a burst owed: resume on the clock rather than catch up.
+    $self->{next_rtp} = $now + RTP_TICK if $self->{next_rtp} < $now - RTP_TICK;
     $self->{next_rtp} += RTP_TICK;
-    $self->{next_rtp} = $now + RTP_TICK if $self->{next_rtp} < $now - 1;
 
     for my $d (values %{ $self->{dialogs_by_call} }) {
         next unless $d->{state} eq 'active' && $d->{rtp} && $d->{remote};

@@ -768,6 +768,17 @@ ok($peer->{acks} >= 1, 'and the gateway ACKed the peer 200');
 cmp_ok($peer->{rx_frames}, '>', 0, 'carrier audio crossed the gateway to the peer');
 cmp_ok($carrier->{rx_frames} - $carrier_rx_before, '>', 0, 'and peer audio came back');
 
+# One 20 ms frame per leg per 20 ms. The loop runs hundreds of times a second,
+# and a packet on every pass put nearly twice the audio on the wire: each
+# inbound queue was drained into padding, which is what choppy audio is.
+my $peer_frames_before = $peer->{rx_frames};
+my $paced_at = time;
+spin(2.0);
+my $paced = ($peer->{rx_frames} - $peer_frames_before) / (time - $paced_at);
+cmp_ok($paced, '<=', 60,
+    sprintf('the peer leg is paced at 50 frames a second, not the loop rate (%.0f/s)', $paced));
+cmp_ok($paced, '>=', 35, sprintf('and it is not starved below that clock (%.0f/s)', $paced));
+
 $carrier->bye_in("127.0.0.1:$sip_port");
 spin(1.0);
 ok($peer->{byes} >= 1, 'hanging up the carrier leg ends the peer leg too');
