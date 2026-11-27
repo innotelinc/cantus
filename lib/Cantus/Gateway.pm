@@ -1007,6 +1007,7 @@ sub _trunk_invite {
         sip_from  => Cantus::Sip::header($msg, 'from'),
         sip_to    => Cantus::Sip::header($msg, 'to'),
         remote_target => $remote_target,
+        route_set => $self->_route_set_from($msg, 0),
         addr      => $msg->{src},   # replies and BYE go where the call came from
     ) or do { $self->_reply($msg, 503); return };
     $d->{invite} = $msg;
@@ -1144,6 +1145,7 @@ sub _new_dialog {
         $d->{sip_from}      = $a{sip_from}      if $a{sip_from};
         $d->{sip_to}        = $a{sip_to}        if $a{sip_to};
         $d->{remote_target} = $a{remote_target} if $a{remote_target};
+        $d->{route_set}     = $a{route_set}     if $a{route_set};
         $d->{trunk_in}  = $a{trunk_in}  ? 1 : 0;
         $d->{trunk_out} = $a{trunk_out} ? 1 : 0;
         # A bridge leg is not the line's own call: the trunk line already holds
@@ -1245,19 +1247,59 @@ sub _send_invite {
     $self->_send_to($d->{addr} // $d->{line}{contact}{addr}, $text);
 }
 
+# A dialog's route set, in the order this end has to use it. A UAS takes the
+# Record-Route values as the request carried them; a UAC takes the response's in
+# reverse. One header may also carry a comma-separated chain, and every hop
+# matters: a request that skips one is a request the call's proxies cannot place.
+sub _route_set_from {
+    my ($self, $msg, $reverse) = @_;
+    my @uris;
+    for my $value (@{ Cantus::Sip::headers_all($msg, 'record-route') }) {
+        for my $part (split /,(?![^<]*>)/, $value) {
+            $part =~ s/^\s+//;
+            $part =~ s/\s+$//;
+            push @uris, $part if length $part;
+        }
+    }
+    @uris = reverse @uris if $reverse;
+    return \@uris;
+}
+
+# Where one of this end's in-dialog requests goes and how it is addressed. With no
+# route set that is simply the remote target. With one, the request is sent to the
+# first hop and the set travels in Route -- or, when that hop asked for strict
+# routing, it becomes the request-URI and the remote target follows it.
+sub _in_dialog_target {
+    my ($self, $d, $remote) = @_;
+    my @route = @{ $d->{route_set} || [] };
+    return ($remote, [], undef) unless @route;
+    my $first = $route[0];
+    my $hop = Cantus::Sip::parse_uri($first) or return ($remote, [], undef);
+    my $addr = $hop->{host} . ':' . $hop->{port};
+    return ($remote, [ map { 'Route: ' . $_ } @route ], $addr) if $first =~ /;lr\b/;
+    (my $uri = $first) =~ s/^<\s*//;
+    $uri =~ s/\s*>$//;
+    shift @route;
+    return ($uri, [ map { 'Route: ' . $_ } ($remote, @route) ], $addr);
+}
+
 sub _send_ack {
     my ($self, $d, $addr) = @_;
+    my $remote = $d->{remote_target}
+        // ('sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise}));
+    my ($uri, $routes, $hop) = $self->_in_dialog_target($d, $remote);
     my $text = Cantus::Sip::request(
         method  => 'ACK',
-        uri     => 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise}),
+        uri     => $uri,
         via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
         from    => '<sip:' . $d->{from_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{from_tag},
         to      => '<sip:' . $d->{to_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{to_tag},
         call_id => $d->{call_id},
         cseq    => $d->{cseq},
         contact => $self->_contact($d->{line}),
+        headers => $routes,
     );
-    $self->_send_to($addr // $d->{addr} // $d->{line}{contact}{addr}, $text);
+    $self->_send_to($hop // $addr // $d->{addr} // $d->{line}{contact}{addr}, $text);
 }
 
 sub _send_cancel {
@@ -1286,18 +1328,24 @@ sub _send_bye {
         // ('<sip:' . $d->{from_user} . '@' . $realm . '>;tag=' . $d->{from_tag});
     my $to = $d->{sip_to} // ('<sip:' . $d->{to_user} . '@' . $realm . '>');
     $to .= ';tag=' . $d->{to_tag} unless $to =~ /;tag=/;
+    # A hangup that skips the proxies the call came through is one they cannot
+    # place: the route set from the INVITE is carried, and the request goes to
+    # the first hop rather than straight to the UAS.
+    my $remote = $d->{remote_target}
+        // ('sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise}));
+    my ($uri, $routes, $hop) = $self->_in_dialog_target($d, $remote);
     my $text = Cantus::Sip::request(
         method  => 'BYE',
-        uri     => $d->{remote_target}
-                   // ('sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise})),
+        uri     => $uri,
         via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
         from    => $from,
         to      => $to,
         call_id => $d->{call_id},
         cseq    => ++$d->{cseq},
         contact => $self->_contact($d->{line}),
+        headers => $routes,
     );
-    $self->_send_to($d->{addr} // $d->{line}{contact}{addr}, $text);
+    $self->_send_to($hop // $d->{addr} // $d->{line}{contact}{addr}, $text);
     # The answer to a BYE is the one place a carrier says it could not place the
     # hangup; without watching for it, a caller left connected looks like a BYE
     # that was never sent.
@@ -1408,6 +1456,12 @@ sub _on_response {
     $d->{pt} = $d->{codec} eq 'PCMA' ? 8 : 0;
     $d->{event_pt} = $answer->{event_pt} // $d->{event_pt};
     $d->{to_tag} = Cantus::Sip::tag($msg, 'to') // $d->{to_tag};
+    # The dialog's route set and remote target come from this answer: this end's
+    # in-dialog requests have to travel the way the call did, and are addressed
+    # to the Contact it names rather than the address the reply came from.
+    $d->{route_set} = $self->_route_set_from($msg, 1);
+    my ($contact) = (Cantus::Sip::header($msg, 'contact') // '') =~ /<\s*(sips?:[^>\s]+)\s*>/;
+    $d->{remote_target} = $contact if $contact;
     $d->{state} = 'active';
     $d->{answered_at} = time;
     $self->_send_ack($d, $msg->{src});

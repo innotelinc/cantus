@@ -56,15 +56,22 @@ sub new {
                                     Proto => 'udp', ReuseAddr => 1) or die "carrier sip: $!";
     my $rtp = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
                                     Proto => 'udp', ReuseAddr => 1) or die "carrier rtp: $!";
+    # The carrier's signalling proxy: it records its route on the calls it
+    # carries, so an in-dialog request from the far end has to come through it.
+    my $proxy = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => 0,
+                                      Proto => 'udp', ReuseAddr => 1) or die "carrier proxy: $!";
     $sip->blocking(0);
     $rtp->blocking(0);
+    $proxy->blocking(0);
     return bless {
-        sip => $sip, rtp => $rtp,
+        sip => $sip, rtp => $rtp, proxy => $proxy,
         sip_port => (sockaddr_in($sip->sockname))[0],
         rtp_port => (sockaddr_in($rtp->sockname))[0],
+        proxy_port => (sockaddr_in($proxy->sockname))[0],
         user => $a{user}, password => $a{password},
         registrations => 0, challenged => 0, digest_ok => 0,
         invites => [], acks => 0, byes => 0,
+        proxied => [], proxy_forwarded => 0,
         in => undef, out => undef,
         rx_frames => 0, rx_peak => 0, phase => 0, seq => 0, ts => 0,
     }, $class;
@@ -74,11 +81,39 @@ sub port       { $_[0]{sip_port} }
 sub rtp_port   { $_[0]{rtp_port} }
 sub addr       { '127.0.0.1:' . $_[0]{sip_port} }
 
-sub _send {
-    my ($self, $text, $to) = @_;
+sub _send_from {
+    my ($self, $sock, $text, $to) = @_;
     my ($ip, $port) = split /:/, $to, 2;
     return unless $ip && $port;
-    CORE::send($self->{sip}, $text, 0, sockaddr_in($port, inet_aton($ip)));
+    CORE::send($sock, $text, 0, sockaddr_in($port, inet_aton($ip)));
+}
+
+sub _send {
+    my ($self, $text, $to) = @_;
+    $self->_send_from($self->{sip}, $text, $to);
+}
+
+# The hop that recorded its route, which is where an in-dialog request has to go
+# once a proxy is in the call. A request addressed straight at the UAS never
+# arrives here at all, which is exactly the failure being modelled.
+sub _pump_proxy {
+    my ($self) = @_;
+    while (1) {
+        my $buf;
+        my $peer = recv($self->{proxy}, $buf, 65535, 0);
+        last unless defined $peer && length $buf;
+        my $msg = Cantus::Sip::parse($buf) or next;
+        next unless $msg->{request};
+        push @{ $self->{proxied} }, {
+            method => $msg->{method} // '?',
+            uri    => $msg->{uri} // '',
+            route  => join('|', @{ Cantus::Sip::headers_all($msg, 'route') }),
+        };
+        # Popped and passed on as a loose proxy does. The headers are forwarded
+        # unchanged: where the request went and how it was addressed is the test.
+        $self->_send_from($self->{proxy}, $buf, '127.0.0.1:' . $self->{sip_port});
+        $self->{proxy_forwarded}++;
+    }
 }
 
 sub _sdp {
@@ -99,11 +134,13 @@ sub invite_in {
     # bracketed form.
     my $contact_uri = "sip:carrier\@127.0.0.1:$self->{sip_port}";
     my $contact = "<$contact_uri>";
+    # A carrier edge in the path records itself, as voip.ms's does.
+    my $route = "<sip:127.0.0.1:$self->{proxy_port};lr>";
     $self->{in} = { call => $call, did => $a{did}, caller => $caller,
                     from_tag => $from_tag, state => 'calling', code => 0,
                     from_hdr => "<sip:$caller\@carrier.example>;tag=$from_tag",
                     to_hdr   => "<sip:$a{did}\@$gw>",
-                    contact  => $contact_uri };
+                    contact  => $contact_uri, route => $route };
     my $text = Cantus::Sip::request(
         method  => 'INVITE',
         uri     => "sip:$a{did}\@$gw",
@@ -113,6 +150,7 @@ sub invite_in {
         call_id => $call,
         cseq    => 1,
         contact => $contact,
+        headers => [ "Record-Route: $route" ],
         body    => $self->_sdp,
     );
     $self->_send($text, $gw);
@@ -145,6 +183,7 @@ sub pump {
         $msg->{src} = inet_ntoa($iaddr) . ':' . $port;
         if ($msg->{request}) { $self->_request($msg) } else { $self->_response($msg) }
     }
+    $self->_pump_proxy;
     $self->_rtp;
 }
 
@@ -216,6 +255,7 @@ sub _request {
         $self->_send(Cantus::Sip::response(
             $msg, 200, to_tag => 'carrier1',
             contact => '<sip:carrier@127.0.0.1:' . $self->{sip_port} . '>',
+            headers => [ 'Record-Route: <sip:127.0.0.1:' . $self->{proxy_port} . ';lr>' ],
             sdp => $self->_sdp,
         ), $msg->{src});
         $self->{out}{state} = 'active';
@@ -801,6 +841,24 @@ cmp_ok($carrier->{byes}, '>', $byes_before, 'the softphone hanging up sends the 
 ok($carrier->{bye_placed},
    'and the carrier can place that BYE in the dialog it opened')
     or diag("the BYE did not match the carrier's dialog: $carrier->{bye_why}");
+
+# The carrier's edge recorded its route on the INVITE, so the hangup has to travel
+# through it: a BYE addressed straight at the UAS never reaches the proxy that
+# holds the call, which is what a 481 and a caller still connected look like.
+my ($proxy_bye) = grep { $_->{method} eq 'BYE' } @{ $carrier->{proxied} };
+ok($proxy_bye, 'the BYE follows the route set to the proxy that recorded it');
+is($proxy_bye ? $proxy_bye->{uri} : '', $carrier->{in}{contact},
+   'addressed to the carrier Contact, not the extension');
+like($proxy_bye ? $proxy_bye->{route} : '', qr/127\.0\.0\.1:$carrier->{proxy_port};lr/,
+     'and carrying the hop the call came through');
+
+# A chain arrives as repeated headers or as one comma-separated value; keeping
+# only the first hop is the bug this guards against.
+my $chain = Cantus::Sip::parse(
+    "INVITE sip:x\@y SIP/2.0\r\nRecord-Route: <sip:p1.example;lr>\r\n"
+  . "Record-Route: <sip:p2.example;lr>, <sip:p3.example;lr>\r\n\r\n");
+is(scalar @{ Cantus::Sip::headers_all($chain, 'record-route') }, 2,
+   'every Record-Route header is kept, not only the first');
 my ($hung) = grep { ($_->{from} // '') eq '14135550121' } cdr_events();
 ok($hung, 'and the call is closed in the CDR');
 ok($hung->{answered}, 'as an answered call, not a failed one');
@@ -842,13 +900,22 @@ is($out->{to}, '4443', 'the carrier leg asks for the number that was dialled');
 is($out->{from}, $DID, 'and presents the DID as the caller');
 ok($carrier->{invite_challenged} >= 1, 'the carrier challenges the outbound INVITE, as it did the REGISTER');
 ok($carrier->{invite_digest_ok}, 'and the gateway answers the challenge with a valid digest');
+my ($proxy_ack) = grep { $_->{method} eq 'ACK' } @{ $carrier->{proxied} };
+ok($proxy_ack, 'an ACK for a carrier answer travels the same route set');
 
 # Both ends have to run for either one to carry audio: the carrier only sends
 # while it is pumped, so a phone-only window measures nothing.
-my $rx_before = $carrier->{rx_frames};
 my $pa = wait_audio($phone, 8);
 cmp_ok($pa->{rx_peak}, '>', 0, "the extension hears the carrier ($pa->{rx_frames} frames)");
-cmp_ok($carrier->{rx_frames} - $rx_before, '>', 5, 'and the carrier hears the extension');
+# The carrier sends its tone the moment the call is up, so the slice above can be
+# a single 0.6 s window while the phone is still starting to send. Count the
+# other direction over a window of its own: at 50 frames a second this owes 60,
+# and a handful of frames is a start rather than a media path.
+my $tx_before = $carrier->{rx_frames};
+spin(1.2, $phone);
+my $carrier_got = $carrier->{rx_frames} - $tx_before;
+cmp_ok($carrier_got, '>=', 20,
+    "and the carrier hears the extension ($carrier_got frames in 1.2 s)");
 
 my $byes_at_dial = $carrier->{byes};
 ok($phone->bye, '101 hangs up the carrier call');

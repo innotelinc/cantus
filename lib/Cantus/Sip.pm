@@ -30,17 +30,20 @@ sub parse {
     }
     my $start = shift @flat // return undef;
 
-    my %h;
+    my (%h, %all);
     for my $line (@flat) {
         next unless $line =~ /^([^:]+):\s*(.*)$/;
         my ($name, $value) = (lc $1, $2);
         $name =~ s/\s+$//;
-        # Only the first of a repeated header is needed here; Contact and Via
-        # repeats are not used by the edge this serves.
+        # Only the first of a repeated header is what the edge reads; Contact and
+        # Via repeats are not used by the edge this serves. Every value is kept
+        # as well, because a Record-Route chain is a list and one hop of it is a
+        # dialog this end can never leave the way it arrived.
         $h{$name} = $value unless exists $h{$name};
+        push @{ $all{$name} }, $value;
     }
 
-    my $msg = { headers => \%h, body => ($body // ''), raw => $buf, start => $start };
+    my $msg = { headers => \%h, all => \%all, body => ($body // ''), raw => $buf, start => $start };
     if ($start =~ m{^([A-Z]+)\s+(\S+)\s+SIP/(\d\.\d)$}) {
         @$msg{qw(method uri version)} = ($1, $2, $3);
         @$msg{qw(request)} = (1);
@@ -56,6 +59,14 @@ sub parse {
 }
 
 sub header { my ($msg, $name) = @_; return $msg->{headers}{ lc $name } }
+
+# Every value of a header that may repeat, in the order it arrived. A dialog's
+# route set is one of these, and taking only the first value is how a request
+# ends up addressed to the proxy instead of through it.
+sub headers_all {
+    my ($msg, $name) = @_;
+    return $msg->{all}{ lc $name } || [];
+}
 
 # "<sip:101@1.2.3.4:5060;transport=udp>" -> { uri, user, host, port }
 sub parse_uri {
