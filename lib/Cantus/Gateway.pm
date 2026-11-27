@@ -1238,6 +1238,13 @@ sub _send_invite {
     my $uri = 'sip:' . $d->{to_user} . '@' . $host;
     my @headers;
     push @headers, $auth if $auth;
+    # The peer is addressed by extension (`sip:101`), so the number the carrier
+    # dialled exists only on this side of the gateway. It travels with the leg as
+    # a header: without it the switch behind the peer can only see the extension
+    # and logs every carrier call against the line that answered instead of the
+    # number that was dialled.
+    push @headers, 'X-Cantus-DID: ' . $d->{from_user}
+        if $d->{peer_in} && defined $d->{from_user} && length $d->{from_user};
     my $text = Cantus::Sip::request(
         method  => 'INVITE',
         uri     => $uri,

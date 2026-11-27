@@ -498,6 +498,7 @@ sub _request {
             call => Cantus::Sip::header($msg, 'call-id'),
             to   => $ext,
             from => $from ? $from->{user} : undef,
+            did  => Cantus::Sip::header($msg, 'x-cantus-did'),
         };
         $self->{call} = Cantus::Sip::header($msg, 'call-id');
         $self->{gw} = $msg->{src};
@@ -812,6 +813,12 @@ spin(2.0);
 is($carrier->{in}{code}, 200, 'the carrier is answered once the peer answers');
 ok(@{ $peer->{invites} } >= 1, 'the peer saw the INVITE');
 is($peer->{invites}[-1]{to}, '101', 'for extension 101');
+# The peer is dialled by extension, so the DID it was reached on is not in the
+# request URI. The switch behind the peer is the one that logs the call, and a
+# row naming the line instead of the dialled number is a row the operator cannot
+# reconcile: the number travels on the leg as a header.
+is($peer->{invites}[-1]{did}, '14135550120',
+   'and carries the DID it arrived on, so the switch can log the dialled number');
 ok($peer->{acks} >= 1, 'and the gateway ACKed the peer 200');
 cmp_ok($peer->{rx_frames}, '>', 0, 'carrier audio crossed the gateway to the peer');
 cmp_ok($carrier->{rx_frames} - $carrier_rx_before, '>', 0, 'and peer audio came back');
