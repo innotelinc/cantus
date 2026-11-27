@@ -813,12 +813,12 @@ spin(2.0);
 is($carrier->{in}{code}, 200, 'the carrier is answered once the peer answers');
 ok(@{ $peer->{invites} } >= 1, 'the peer saw the INVITE');
 is($peer->{invites}[-1]{to}, '101', 'for extension 101');
-# The peer is dialled by extension, so the DID it was reached on is not in the
-# request URI. The switch behind the peer is the one that logs the call, and a
-# row naming the line instead of the dialled number is a row the operator cannot
-# reconcile: the number travels on the leg as a header.
-is($peer->{invites}[-1]{did}, '14135550120',
-   'and carries the DID it arrived on, so the switch can log the dialled number');
+# Nothing is added to describe the call. What the peer is asked to do is in the
+# request-URI, and the switch behind it owns the DID table that decides which
+# line rings: a header naming the number as well would be a second channel for
+# the same fact, and two answers to "where does this DID go".
+ok(!defined $peer->{invites}[-1]{did},
+   'and carries no out-of-band header describing the call');
 ok($peer->{acks} >= 1, 'and the gateway ACKed the peer 200');
 cmp_ok($peer->{rx_frames}, '>', 0, 'carrier audio crossed the gateway to the peer');
 cmp_ok($carrier->{rx_frames} - $carrier_rx_before, '>', 0, 'and peer audio came back');

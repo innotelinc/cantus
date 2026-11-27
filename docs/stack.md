@@ -51,34 +51,33 @@ storage layers rather than inside them.
 
 Cantus has no opinion about SIP, but a deployment needs one place where the two
 meet. That is the gateway, and a routing rule can hand a call to a SIP PBX instead
-of a Cantus line: `forward to sip:<extension>`. The gateway dials that extension at
-the configured peer, so the call rides Cantus up to the gateway and SIP after it.
+of a Cantus line: `forward to sip:<target>`. The gateway places the call at the
+configured peer, so it rides Cantus up to the gateway and SIP after it.
 
-A peer INVITE is an ordinary SIP request with one addition:
+A peer INVITE says everything it needs in the ordinary headers:
 
 ```
-INVITE sip:101@<peer host> SIP/2.0
+INVITE sip:14132642700@<peer host> SIP/2.0
 From: <sip:4132642700@<realm>>;tag=…
-To:   <sip:101@<realm>>
-X-Cantus-DID: 4132642700
+To:   <sip:14132642700@<realm>>
 ```
 
-- **Request-URI and `To`** name the extension the rule chose. That is the whole ask:
-  route the call to extension 101 on that switch.
+- **The request-URI is the target the rule named, verbatim** — an extension
+  (`sip:101`) or, for an inbound DID, the number that was dialled
+  (`sip:14132642700`). The gateway forwards it; it does not decide what it means.
 - **`From`** is the number the carrier dialled, which is also the extension the
   inbound Cantus leg registered.
-- **`X-Cantus-DID`** carries that dialled number explicitly. The peer is addressed
-  by extension, so a PBX writing a call record from its own CDR would name the line
-  that answered (`101`) and never the number the caller dialled — the gateway is the
-  only party that still knows it. The header is informational: routing is settled
-  by the request-URI, and a peer that ignores it still receives a correct call.
-- It is stamped on the peer INVITE **and** on the authenticated retry after a `401`,
-  so it is present whichever attempt the peer accepts.
+- **Nothing is added to the request.** There is no out-of-band header describing
+  the call: a PBX that holds a DID table maps the number in the request-URI to the
+  line that rings, and that table is the one its own dialplan is generated from.
+  A header naming the number as well would be a second channel for the same fact,
+  and two answers to "where does this DID go" is the drift a single routing
+  document exists to prevent.
 
-Recording the number is the receiving switch's business, not the protocol's. In the
-Innotel deployment the peer's dialplan copies the header into the CDR's user field
-and the control plane reads it back; see telno's `docs/ARCHITECTURE.md`,
-"Inbound calls through the gateway edge", for that half of the contract.
+This is what makes the gateway look like a carrier to the switch behind it: the
+same request a trunk would make, entering the same context, decided by the same
+table. Recording it is the switch's business; see telno's `docs/ARCHITECTURE.md`,
+"Inbound calls through the gateway edge", for that half.
 
 ## Interoperability posture
 
