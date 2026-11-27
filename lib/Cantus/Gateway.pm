@@ -992,12 +992,21 @@ sub _trunk_invite {
     my $sdp = Cantus::Sip::sdp_parse($msg->{body});
     unless ($sdp && $sdp->{ip}) { $self->_reply($msg, 488); return }
 
+    # The BYE sent later is an in-dialog request, and the carrier matches it on
+    # the dialog it opened: the From it sent (URI and tag), a To naming what it
+    # dialled, and a request-URI pointing at the Contact it published. Built
+    # from the local line instead -- extension 101, our own realm -- the BYE is
+    # one the carrier cannot place, and its caller stays connected.
+    my ($remote_target) = (Cantus::Sip::header($msg, 'contact') // '') =~ /<\s*(sips?:[^>\s]+)\s*>/;
     my $d = $self->_new_dialog($line,
         call_id   => $call_id,
         from_tag  => Cantus::Sip::tag($msg, 'from') // 'carrier',
         codec     => $sdp->{codec}, event_pt => $sdp->{event_pt},
         phone_placed => 0, trunk_in => 1,
         from_user => $did, to_user => ($aor // $peer_ext), target_aor => $aor,
+        sip_from  => Cantus::Sip::header($msg, 'from'),
+        sip_to    => Cantus::Sip::header($msg, 'to'),
+        remote_target => $remote_target,
         addr      => $msg->{src},   # replies and BYE go where the call came from
     ) or do { $self->_reply($msg, 503); return };
     $d->{invite} = $msg;
@@ -1130,6 +1139,11 @@ sub _new_dialog {
         $d->{addr}      = $a{addr} if $a{addr};
         $d->{peer_call} = $a{peer_call};
         $d->{route}     = $a{route};
+        # The dialog a far end opened, kept verbatim so its BYE can be repeated
+        # rather than rebuilt from what this gateway happens to call things.
+        $d->{sip_from}      = $a{sip_from}      if $a{sip_from};
+        $d->{sip_to}        = $a{sip_to}        if $a{sip_to};
+        $d->{remote_target} = $a{remote_target} if $a{remote_target};
         $d->{trunk_in}  = $a{trunk_in}  ? 1 : 0;
         $d->{trunk_out} = $a{trunk_out} ? 1 : 0;
         # A bridge leg is not the line's own call: the trunk line already holds
@@ -1261,19 +1275,35 @@ sub _send_cancel {
     $self->_send_to($d->{addr} // $d->{line}{contact}{addr}, $text);
 }
 
+# A BYE is an in-dialog request: it has to repeat the dialog's own identifiers,
+# or the far end answers 481 and keeps the call up. A leg this gateway opened
+# names its own From and To; a leg a carrier opened carries the carrier's, so
+# those are used verbatim when the dialog recorded them.
 sub _send_bye {
     my ($self, $d, $reason) = @_;
+    my $realm = $d->{sip_realm} // $self->{realm};
+    my $from = $d->{sip_from}
+        // ('<sip:' . $d->{from_user} . '@' . $realm . '>;tag=' . $d->{from_tag});
+    my $to = $d->{sip_to} // ('<sip:' . $d->{to_user} . '@' . $realm . '>');
+    $to .= ';tag=' . $d->{to_tag} unless $to =~ /;tag=/;
     my $text = Cantus::Sip::request(
         method  => 'BYE',
-        uri     => 'sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise}),
+        uri     => $d->{remote_target}
+                   // ('sip:' . $d->{to_user} . '@' . ($d->{uri_host} // $self->{advertise})),
         via     => $self->{advertise} . ':' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
-        from    => '<sip:' . $d->{from_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{from_tag},
-        to      => '<sip:' . $d->{to_user} . '@' . ($d->{sip_realm} // $self->{realm}) . '>;tag=' . $d->{to_tag},
+        from    => $from,
+        to      => $to,
         call_id => $d->{call_id},
         cseq    => ++$d->{cseq},
         contact => $self->_contact($d->{line}),
     );
     $self->_send_to($d->{addr} // $d->{line}{contact}{addr}, $text);
+    # The answer to a BYE is the one place a carrier says it could not place the
+    # hangup; without watching for it, a caller left connected looks like a BYE
+    # that was never sent.
+    $self->{bye_watch}{ $d->{call_id} } = time;
+    delete $self->{bye_watch}{$_}
+        for grep { time - $self->{bye_watch}{$_} > 64 } keys %{ $self->{bye_watch} };
     $self->emit({ kind => 'bye-sent', call => $d->{call_id}, reason => $reason });
 }
 
@@ -1288,8 +1318,18 @@ sub _on_response {
         if (($cm // '') eq 'REGISTER') { $self->_trunk_response($msg); return }
     }
 
-    my $d = $self->{pending}{$call_id} or return;
+    my $d = $self->{pending}{$call_id};
     my $code = $msg->{status} // 0;
+    unless ($d) {
+        # A BYE is a request, not a pending dialog, so its answer never reaches
+        # the lookup below. A 481 here is the far end saying it could not place
+        # the hangup -- the caller still being connected, from this side.
+        if (delete $self->{bye_watch}{$call_id}) {
+            $self->emit({ kind => $code >= 300 ? 'bye-refused' : 'bye-answered',
+                          call => $call_id, code => $code });
+        }
+        return;
+    }
     return if $code < 200;
 
     # The internal peer challenges its INVITEs too: being on the loopback is

@@ -92,17 +92,27 @@ sub invite_in {
     my $gw = $a{gw};   # host:port of the gateway's SIP socket
     my $call = 'carrier-in-' . int(rand(1_000_000_000));
     my $from_tag = 'cin' . int(rand(1_000_000));
-    $self->{in} = { call => $call, did => $a{did}, caller => $a{caller} // '14135550100',
-                    from_tag => $from_tag, state => 'calling', code => 0 };
+    my $caller = $a{caller} // '14135550100';
+    # Kept verbatim, because the dialog this carrier opened is the only thing
+    # that can say whether a BYE from the gateway belongs to it. The request-URI
+    # a BYE has to carry is the bare URI inside this Contact, never the
+    # bracketed form.
+    my $contact_uri = "sip:carrier\@127.0.0.1:$self->{sip_port}";
+    my $contact = "<$contact_uri>";
+    $self->{in} = { call => $call, did => $a{did}, caller => $caller,
+                    from_tag => $from_tag, state => 'calling', code => 0,
+                    from_hdr => "<sip:$caller\@carrier.example>;tag=$from_tag",
+                    to_hdr   => "<sip:$a{did}\@$gw>",
+                    contact  => $contact_uri };
     my $text = Cantus::Sip::request(
         method  => 'INVITE',
         uri     => "sip:$a{did}\@$gw",
         via     => '127.0.0.1:' . $self->{sip_port} . ';branch=z9hG4bK' . int(rand(1_000_000)),
-        from    => "<sip:$self->{in}{caller}\@carrier.example>;tag=$from_tag",
-        to      => "<sip:$a{did}\@$gw>",
+        from    => $self->{in}{from_hdr},
+        to      => $self->{in}{to_hdr},
         call_id => $call,
         cseq    => 1,
-        contact => '<sip:carrier@127.0.0.1:' . $self->{sip_port} . '>',
+        contact => $contact,
         body    => $self->_sdp,
     );
     $self->_send($text, $gw);
@@ -215,7 +225,27 @@ sub _request {
     if ($method eq 'ACK')  { $self->{acks}++; return }
     if ($method eq 'BYE')  {
         $self->{byes}++;
-        $self->_send(Cantus::Sip::response($msg, 200), $msg->{src});
+        # A UAS places an in-dialog request only inside the dialog it opened:
+        # same Call-ID, the From it sent (URI and tag), a To carrying the tag
+        # from its own 200, and a request-URI naming the Contact it published.
+        # Anything else is 481 -- and a caller whose phone never drops is
+        # exactly what a 481 looks like from the far side of the call.
+        my $in = $self->{in};
+        my $call = Cantus::Sip::header($msg, 'call-id') // '';
+        my ($placed, $why) = (0, 'no call to place it in');
+        if ($in && $call eq $in->{call}) {
+            my $from = Cantus::Sip::header($msg, 'from') // '';
+            my $to   = Cantus::Sip::header($msg, 'to') // '';
+            my $uri  = $msg->{uri} // '';
+            my $want_to = $in->{to_hdr} . ';tag=' . ($in->{to_tag} // 'gw');
+            if    ($from ne $in->{from_hdr}) { $why = "From $from" }
+            elsif ($to   ne $want_to)        { $why = "To $to (want $want_to)" }
+            elsif ($uri  ne $in->{contact})  { $why = "request-URI $uri" }
+            else  { ($placed, $why) = (1, 'matched') }
+        }
+        $self->{bye_placed} = $placed;
+        $self->{bye_why} = $why;
+        $self->_send(Cantus::Sip::response($msg, $placed ? 200 : 481), $msg->{src});
         $self->{out}{state} = 'ended' if $self->{out};
         return;
     }
@@ -757,6 +787,9 @@ is($carrier->{in}{code}, 200, 'a second DID is answered by the peer');
 $peer->hangup;
 spin(1.2);
 cmp_ok($carrier->{byes}, '>', $byes_before, 'the softphone hanging up sends the carrier a BYE');
+ok($carrier->{bye_placed},
+   'and the carrier can place that BYE in the dialog it opened')
+    or diag("the BYE did not match the carrier's dialog: $carrier->{bye_why}");
 my ($hung) = grep { ($_->{from} // '') eq '14135550121' } cdr_events();
 ok($hung, 'and the call is closed in the CDR');
 ok($hung->{answered}, 'as an answered call, not a failed one');
